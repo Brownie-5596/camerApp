@@ -30,6 +30,13 @@ enum Stops {
         3.2, 4, 5, 6, 8, 10, 13, 15, 20, 25, 30, 40, 50, 60, 90, 120, 180, 240, 300, 480, 600,
     ]
 
+    static let isoFullStops: [Float] = [25, 50, 100, 200, 400, 800, 1600, 3200, 6400, 12800]
+
+    static let shutterFullStops: [Double] = [
+        1.0 / 8000, 1.0 / 4000, 1.0 / 2000, 1.0 / 1000, 1.0 / 500, 1.0 / 250, 1.0 / 125, 1.0 / 60,
+        1.0 / 30, 1.0 / 15, 1.0 / 8, 1.0 / 4, 0.5, 1, 2, 4, 8, 15, 30, 60, 120, 240, 480,
+    ]
+
     static let evBias: [Float] = (-9...9).map { Float($0) / 3 }
 
     static func isoStops(in range: ClosedRange<Float>) -> [Float] {

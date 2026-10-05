@@ -21,6 +21,7 @@ struct ContentView: View {
     @State private var showSettings = false
     @State private var showPresets = false
     @State private var tapPoint: CGPoint?
+    @State private var pinchStartZoom: CGFloat?
     @State private var burstTask: Task<Void, Never>?
     @State private var burstCount = 0
     @State private var lastCrash: String? = Diagnostics.takeLastCrash()
@@ -123,9 +124,21 @@ struct ContentView: View {
     private var topBar: some View {
         HStack(spacing: 14) {
             chip(camera.format.rawValue) {
-                let options = OutputFormat.allCases.filter { camera.rawSupported || !$0.needsRAW }
+                let options = OutputFormat.allCases.filter { format in
+                    switch format {
+                    case .heif: return true
+                    case .proRAW: return camera.proRAWSupported
+                    case .raw, .rawPlusHEIF: return camera.rawSupported
+                    }
+                }
                 if let i = options.firstIndex(of: camera.format) {
                     camera.format = options[(i + 1) % options.count]
+                }
+            }
+            if let label = camera.highResolutionLabel {
+                chip(camera.useHighResolution ? label.replacingOccurrences(of: " ", with: "") : "12MP") {
+                    camera.useHighResolution.toggle()
+                    camera.show(camera.useHighResolution ? "Full resolution (\(label))" : "Standard resolution (12 MP)")
                 }
             }
             chip(camera.stackMode.shortName) {
@@ -181,6 +194,15 @@ struct ContentView: View {
                         if tapPoint == location { tapPoint = nil }
                     }
                 }
+                .gesture(
+                    MagnifyGesture()
+                        .onChanged { value in
+                            let start = pinchStartZoom ?? camera.zoomFactor
+                            pinchStartZoom = start
+                            camera.setZoom(start * value.magnification)
+                        }
+                        .onEnded { _ in pinchStartZoom = nil }
+                )
 
             Group {
                 if peaking, let image = camera.peakingImage {
@@ -213,6 +235,21 @@ struct ContentView: View {
         .overlay(alignment: .top) {
             if let status = statusText {
                 badge(status).padding(.top, showHistogram ? 58 : 0)
+            }
+        }
+        .overlay(alignment: .topTrailing) {
+            if camera.zoomFactor > 1.01 {
+                Button {
+                    camera.setZoom(1)
+                } label: {
+                    Text(String(format: "%.1f×", camera.zoomFactor))
+                        .font(.caption.bold().monospacedDigit())
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Color.black.opacity(0.6), in: Capsule())
+                }
+                .foregroundStyle(theme.accent)
+                .padding(8)
             }
         }
         .overlay(alignment: .bottom) {

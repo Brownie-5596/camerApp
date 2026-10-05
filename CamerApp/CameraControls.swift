@@ -11,8 +11,11 @@ import AVFoundation
 final class CameraControlsManager: NSObject, AVCaptureSessionControlsDelegate {
     private weak var camera: CameraController?
     private let lenses: [LensOption]
-    private let shutterValues: [ShutterStop] = Stops.shutter.map { .time($0) } + [.bulb]
-    private let isoValues: [Float] = Stops.iso
+    /// Whole stops make each notch of the slide a bigger change.
+    var fullStops = UserDefaults.standard.bool(forKey: "controlFullStops")
+    private var shutterValues: [ShutterStop] = []
+    private var isoValues: [Float] = []
+    private var zoomSlider: AVCaptureSlider?
 
     private var shutterPicker: AVCaptureIndexPicker?
     private var isoPicker: AVCaptureIndexPicker?
@@ -31,6 +34,9 @@ final class CameraControlsManager: NSObject, AVCaptureSessionControlsDelegate {
     /// Call on the session queue.
     func install(on session: AVCaptureSession) {
         guard session.supportsControls else { return }
+
+        shutterValues = (fullStops ? Stops.shutterFullStops : Stops.shutter).map { .time($0) } + [.bulb]
+        isoValues = fullStops ? Stops.isoFullStops : Stops.iso
 
         let shutterValues = self.shutterValues
         let shutter = AVCaptureIndexPicker("Shutter", symbolName: "timer",
@@ -62,6 +68,11 @@ final class CameraControlsManager: NSObject, AVCaptureSessionControlsDelegate {
             self?.camera?.selectLens(lenses[index].id)
         }
 
+        let zoom = AVCaptureSlider("Zoom", symbolName: "plus.magnifyingglass", in: 1...10)
+        zoom.localizedValueFormat = "%.1f×"
+        zoom.prominentValues = [1, 2, 5, 10]
+        zoom.setActionQueue(.main) { [weak self] value in self?.camera?.setZoom(CGFloat(value)) }
+
         let whiteBalance = AVCaptureSlider("White balance", symbolName: "thermometer.medium", in: 2000...10000, step: 100)
         whiteBalance.localizedValueFormat = "%.0fK"
         whiteBalance.setActionQueue(.main) { [weak self] value in self?.camera?.setWhiteBalance(value) }
@@ -81,7 +92,7 @@ final class CameraControlsManager: NSObject, AVCaptureSessionControlsDelegate {
         // Most useful first, in case the phone limits how many controls an app can have.
         var controls: [AVCaptureControl] = [shutter, iso, focus, ev]
         if lenses.count > 1 { controls.append(lens) }
-        controls += [whiteBalance, stack, lightning]
+        controls += [zoom, whiteBalance, stack, lightning]
 
         // The delegate must be set before any control is added, or AVFoundation throws.
         session.setControlsDelegate(self, queue: .main)
@@ -100,6 +111,7 @@ final class CameraControlsManager: NSObject, AVCaptureSessionControlsDelegate {
         whiteBalanceSlider = whiteBalance
         stackPicker = stack
         lightningPicker = lightning
+        zoomSlider = zoom
     }
 
     /// Bring the controls in line with whatever was changed on screen.
@@ -119,6 +131,7 @@ final class CameraControlsManager: NSObject, AVCaptureSessionControlsDelegate {
             stackPicker?.selectedIndex = index
         }
         lightningPicker?.selectedIndex = camera.lightningArmed ? 1 : 0
+        zoomSlider?.value = Float(camera.zoomFactor)
     }
 
     func sessionControlsDidBecomeActive(_ session: AVCaptureSession) { sync() }

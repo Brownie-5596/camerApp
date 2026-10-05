@@ -7,6 +7,7 @@ import UIKit
 enum OutputFormat: String, CaseIterable, Identifiable {
     case heif = "HEIF"
     case raw = "RAW"
+    case proRAW = "ProRAW"
     case rawPlusHEIF = "RAW+HEIF"
     var id: String { rawValue }
     var needsRAW: Bool { self != .heif }
@@ -53,6 +54,7 @@ final class CameraController: NSObject, ObservableObject {
     private var videoInput: AVCaptureDeviceInput?
     private var devicesByID: [String: AVCaptureDevice] = [:]
     private var rawFormatType: OSType?
+    private var proRAWFormatType: OSType?
     private var standardPhotoDimensions: CMVideoDimensions?
     private var largestPhotoDimensions: CMVideoDimensions?
     private var inFlight: [Int64: PhotoCaptureProcessor] = [:]
@@ -122,6 +124,17 @@ final class CameraController: NSObject, ObservableObject {
     @Published var rawSupported = false
     /// e.g. "48 MP" when the lens can shoot above 12 MP.
     @Published var highResolutionLabel: String?
+    @Published var proRAWSupported = false
+    /// Digital zoom on top of the selected lens (pinch the preview).
+    @Published var zoomFactor: CGFloat = 1
+    @Published var maxZoomFactor: CGFloat = 10
+    /// Camera Control moves in whole stops instead of thirds (bigger change per swipe).
+    @Published var cameraControlFullStops = false {
+        didSet {
+            UserDefaults.standard.set(cameraControlFullStops, forKey: "controlFullStops")
+            reinstallCameraControls()
+        }
+    }
 
     @Published var magnifierOn = false
     @Published var isCapturing = false
@@ -144,6 +157,7 @@ final class CameraController: NSObject, ObservableObject {
         selfTimerSeconds = defaults.integer(forKey: "selfTimer")
         lightningSensitivity = LightningSensitivity(rawValue: defaults.string(forKey: "lightningSensitivity") ?? "") ?? .medium
         useHighResolution = defaults.bool(forKey: "highResolution")
+        cameraControlFullStops = defaults.bool(forKey: "controlFullStops")
         if defaults.object(forKey: "saveLocation") != nil {
             saveLocation = defaults.bool(forKey: "saveLocation")
         }
@@ -333,8 +347,12 @@ final class CameraController: NSObject, ObservableObject {
         }()
 
         // Bayer RAW (plain DNG), not Apple ProRAW.
+        if photoOutput.isAppleProRAWSupported { photoOutput.isAppleProRAWEnabled = true }
         rawFormatType = photoOutput.availableRawPhotoPixelFormatTypes.first { !AVCapturePhotoOutput.isAppleProRAWPixelFormat($0) }
+        proRAWFormatType = photoOutput.availableRawPhotoPixelFormatTypes.first { AVCapturePhotoOutput.isAppleProRAWPixelFormat($0) }
         let hasRAW = rawFormatType != nil
+        let hasProRAW = proRAWFormatType != nil
+        let maxZoom = min(10, newDevice.maxAvailableVideoZoomFactor)
         let fmt = newDevice.activeFormat
         let isoRange = fmt.minISO...fmt.maxISO
         let isoStops = Stops.isoStops(in: isoRange)
@@ -353,12 +371,17 @@ final class CameraController: NSObject, ObservableObject {
             self.maxDeviceExposure = maxExposure
             self.shutterStops = shutterStops
             self.highResolutionLabel = highResLabel
+            self.proRAWSupported = hasProRAW
+            self.zoomFactor = 1
+            self.maxZoomFactor = maxZoom
             self.iso = min(max(self.iso, isoRange.lowerBound), isoRange.upperBound)
             if self.autoShutter {
                 self.exposureSeconds = min(max(self.exposureSeconds, minExposure), maxExposure)
             }
             self.rawSupported = hasRAW
-            if !hasRAW && self.format.needsRAW { self.format = .heif }
+            if (self.format == .proRAW && !hasProRAW) || (self.format.needsRAW && self.format != .proRAW && !hasRAW) {
+                self.format = .heif
+            }
 
             let coordinator = AVCaptureDevice.RotationCoordinator(device: newDevice, previewLayer: self.previewLayer)
             self.rotationCoordinator = coordinator
@@ -427,8 +450,31 @@ final class CameraController: NSObject, ObservableObject {
 
     func setMagnifier(_ on: Bool) {
         magnifierOn = on
+        let target = on ? min(zoomFactor * 5, maxZoomFactor * 2) : zoomFactor
         withLockedDevice { d in
-            d.videoZoomFactor = on ? min(5, d.activeFormat.videoMaxZoomFactor) : 1
+            d.videoZoomFactor = min(max(target, 1), d.maxAvailableVideoZoomFactor)
+        }
+    }
+
+    func setZoom(_ factor: CGFloat) {
+        zoomFactor = min(max(factor, 1), maxZoomFactor)
+        magnifierOn = false
+        let target = zoomFactor
+        withLockedDevice { d in
+            d.videoZoomFactor = min(target, d.maxAvailableVideoZoomFactor)
+        }
+    }
+
+    private func reinstallCameraControls() {
+        if #available(iOS 18.0, *) {
+            let fullStops = cameraControlFullStops
+            sessionQueue.async {
+                guard let controls = self.cameraControls as? CameraControlsManager else { return }
+                controls.fullStops = fullStops
+                if let failure = Diagnostics.guarded("Camera Control setup", { controls.install(on: self.session) }) {
+                    DispatchQueue.main.async { self.show(failure) }
+                }
+            }
         }
     }
 
@@ -680,7 +726,9 @@ final class CameraController: NSObject, ObservableObject {
     /// camera is free for the next shot; saving carries on in the background.
     func takePicture(completion: @escaping (Bool) -> Void = { _ in }) {
         if magnifierOn { setMagnifier(false) }
-        if isLongExposure {
+        if isLongExposure && stackMode == .rawFrames {
+            startRAWFrames(completion: completion)
+        } else if isLongExposure {
             startStack(completion: completion)
         } else {
             capturePhoto(completion: completion)
@@ -753,12 +801,43 @@ final class CameraController: NSObject, ObservableObject {
 
     /// Ends a Bulb exposure, or a timed one early, and saves what has been collected.
     func finishStack() {
+        rawFramesTask?.cancel()
         frameProcessor.finishStack()
     }
 
-    private func capturePhoto(completion: @escaping (Bool) -> Void) {
-        let format = self.format
-        let highResolution = useHighResolution && format == .heif
+    private var rawFramesTask: Task<Void, Never>?
+
+    /// "RAW frames" long exposure: shoots the exposure as a series of full-resolution RAW photos
+    /// (ProRAW 48 MP when available) for stacking later in an astro app such as Sequator or Siril.
+    private func startRAWFrames(completion: @escaping (Bool) -> Void) {
+        if lightningArmed { setLightning(false) }
+        let frames = plannedFrames
+        let rawFormat: OutputFormat = proRAWSupported ? .proRAW : .raw
+        isStacking = true
+        stackFrames = 0
+        stackFrameTarget = frames
+        stackSubExposure = subExposure
+        rawFramesTask = Task { @MainActor in
+            var taken = 0
+            while !Task.isCancelled, frames == nil || taken < frames! {
+                let ok = await withCheckedContinuation { continuation in
+                    self.capturePhoto(formatOverride: rawFormat) { continuation.resume(returning: $0) }
+                }
+                if !ok { break }
+                taken += 1
+                self.stackFrames = taken
+            }
+            self.isStacking = false
+            self.stackFrameTarget = nil
+            self.rawFramesTask = nil
+            self.show("Saved \(taken) RAW frames for stacking")
+            completion(taken > 0)
+        }
+    }
+
+    private func capturePhoto(formatOverride: OutputFormat? = nil, completion: @escaping (Bool) -> Void) {
+        let format = formatOverride ?? self.format
+        let highResolution = useHighResolution && (format == .heif || format == .proRAW)
         let angle = rotationCoordinator?.videoRotationAngleForHorizonLevelCapture
         let fix = location.snapshot(enabled: saveLocation)
         let gps = fix.location.map { Metadata.gps(location: $0, heading: fix.heading) }
@@ -768,7 +847,9 @@ final class CameraController: NSObject, ObservableObject {
         sessionQueue.async {
             let settings: AVCapturePhotoSettings
             let hevc = self.photoOutput.availablePhotoCodecTypes.contains(.hevc)
-            if format.needsRAW, let raw = self.rawFormatType {
+            if format == .proRAW, let raw = self.proRAWFormatType {
+                settings = AVCapturePhotoSettings(rawPixelFormatType: raw)
+            } else if format.needsRAW, let raw = self.rawFormatType {
                 if format == .rawPlusHEIF && hevc {
                     settings = AVCapturePhotoSettings(rawPixelFormatType: raw,
                                                       processedFormat: [AVVideoCodecKey: AVVideoCodecType.hevc])
@@ -783,8 +864,9 @@ final class CameraController: NSObject, ObservableObject {
             if let dimensions = highResolution ? self.largestPhotoDimensions : self.standardPhotoDimensions {
                 settings.maxPhotoDimensions = dimensions
             }
-            // Single frame, no multi-frame fusion, so the exposure you set is the exposure you get.
-            settings.photoQualityPrioritization = .speed
+            // .speed keeps a single frame (the exposure you set is the exposure you get), but iOS
+            // only delivers 48 MP and ProRAW at .balanced or higher.
+            settings.photoQualityPrioritization = (highResolution || format == .proRAW) ? .balanced : .speed
             if self.photoOutput.supportedFlashModes.contains(.off) { settings.flashMode = .off }
 
             if let angle, let connection = self.photoOutput.connection(with: .video),

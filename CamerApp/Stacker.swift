@@ -7,6 +7,7 @@ enum StackMode: String, CaseIterable, Identifiable, Codable {
     case longExposure = "Long exposure"
     case average = "Average"
     case brightest = "Brightest"
+    case rawFrames = "RAW frames"
 
     var id: String { rawValue }
 
@@ -15,6 +16,7 @@ enum StackMode: String, CaseIterable, Identifiable, Codable {
         case .longExposure: return "LONG"
         case .average: return "AVG"
         case .brightest: return "MAX"
+        case .rawFrames: return "RAW"
         }
     }
 
@@ -26,6 +28,8 @@ enum StackMode: String, CaseIterable, Identifiable, Codable {
             return "Averages the frames. Same brightness as one frame but far less noise. Best for aurora and the Milky Way."
         case .brightest:
             return "Keeps the brightest value of each pixel. Use for star trails, lightning and fireworks."
+        case .rawFrames:
+            return "Saves every frame as a full-resolution RAW photo (48 MP ProRAW on Pro iPhones) instead of combining them. Stack them later in an astro app such as Sequator, Siril or Starry Landscape Stacker for the highest-quality stars. Small gaps between frames."
         }
     }
 }

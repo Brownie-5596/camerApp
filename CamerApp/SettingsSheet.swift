@@ -19,12 +19,11 @@ struct SettingsSheet: View {
                         }
                     }
                     .pickerStyle(.segmented)
-                    .disabled(!camera.rawSupported)
                 } header: {
                     Text("Photo format")
                 } footer: {
                     Text(camera.rawSupported
-                         ? "RAW saves an unprocessed DNG for editing. RAW+HEIF saves both as one photo."
+                         ? "RAW saves a plain 12 MP DNG. ProRAW is Apple's RAW (like the Camera app) and can be 48 MP. RAW+HEIF saves both as one photo."
                          : "This lens doesn't offer RAW.")
                 }
 
@@ -32,7 +31,7 @@ struct SettingsSheet: View {
                     Section {
                         Toggle("Full resolution (\(label))", isOn: $camera.useHighResolution)
                     } footer: {
-                        Text("Uses the whole \(label) sensor for HEIF photos. RAW and stacked shots use the standard resolution.")
+                        Text("Uses the whole \(label) sensor for HEIF and ProRAW photos (also the 12MP/48MP chip at the top). Plain RAW is always 12 MP, and blended long exposures use the video stream, so they are lower resolution; use the RAW frames mode for full-resolution stars.")
                     }
                 }
 
@@ -92,6 +91,11 @@ struct SettingsSheet: View {
                     Text("Volume buttons work as a shutter release. Hold the on-screen shutter to shoot a burst.")
                         .font(.footnote)
                     Text("Camera Control (iPhone 16 and later): press to shoot. Light-press to show a setting, then slide to change it. Light-press twice to choose which setting: shutter, ISO, focus, exposure, lens, white balance, long exposure mode or lightning trigger.")
+                        .font(.footnote)
+                    Toggle("Camera Control: whole stops", isOn: $camera.cameraControlFullStops)
+                    Text("Whole stops make each notch of the slide a bigger jump (1/60 → 1/30 instead of 1/60 → 1/50), so you need to slide less.")
+                        .font(.footnote)
+                    Text("Pinch the preview to zoom; tap the zoom badge to go back to 1×. The ◎ button turns on focus peaking (sharp edges glow green).")
                         .font(.footnote)
                     Text("Tap the preview to focus there. With manual focus, a tap focuses once and locks.")
                         .font(.footnote)

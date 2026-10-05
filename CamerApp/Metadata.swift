@@ -142,7 +142,7 @@ enum Metadata {
         switch kind {
         case .stack(.longExposure): comment = "Long exposure stacked from \(frames) × \(frameLabel) frames"
         case .stack(.average): comment = "Average of \(frames) × \(frameLabel) frames"
-        case .stack(.brightest): comment = "Brightest pixels of \(frames) × \(frameLabel) frames"
+        case .stack(.brightest), .stack(.rawFrames): comment = "Brightest pixels of \(frames) × \(frameLabel) frames"
         case .lightning: comment = "Lightning trigger: brightest pixels of \(frames) × \(frameLabel) frames"
         }
 
