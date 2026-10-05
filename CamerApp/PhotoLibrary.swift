@@ -2,27 +2,58 @@ import AVFoundation
 import CoreLocation
 import Photos
 
-/// Handles one photo capture. Reports as soon as the shutter is done (so the next shot can start)
-/// and again once the photo is saved.
+/// Handles one photo capture. Reports when the exposure ends (so the next shot can start
+/// while this one is still being processed), when processing ends, and once it's saved.
 final class PhotoCaptureProcessor: NSObject, AVCapturePhotoCaptureDelegate {
     private let customizer: MetadataCustomizer
     private let location: CLLocation?
     private let deviceID: String?
+    private let onExposureDone: () -> Void
     private let onCaptured: (Bool) -> Void
     private let onSaved: (Bool, String) -> Void
+    private let onTiming: (String) -> Void
     private var processed: Data?
     private var raw: Data?
 
+    // Timing, to see where the time between pressing and saving goes.
+    private let requested = CACurrentMediaTime()
+    private var exposureStarted: CFTimeInterval?
+    private var exposureEnded: CFTimeInterval?
+    private var processingEnded: CFTimeInterval?
+    private var expectedProcessing: Double?
+
     init(gps: [String: Any]?, location: CLLocation?, deviceID: String?,
-         onCaptured: @escaping (Bool) -> Void, onSaved: @escaping (Bool, String) -> Void) {
+         onExposureDone: @escaping () -> Void,
+         onCaptured: @escaping (Bool) -> Void,
+         onSaved: @escaping (Bool, String) -> Void,
+         onTiming: @escaping (String) -> Void) {
         self.customizer = MetadataCustomizer(gps: gps)
         self.location = location
         self.deviceID = deviceID
+        self.onExposureDone = onExposureDone
         self.onCaptured = onCaptured
         self.onSaved = onSaved
+        self.onTiming = onTiming
+    }
+
+    func photoOutput(_ output: AVCapturePhotoOutput, willBeginCaptureFor resolvedSettings: AVCaptureResolvedPhotoSettings) {
+        if #available(iOS 17.0, *) {
+            let range = resolvedSettings.photoProcessingTimeRange
+            if range.duration.isValid { expectedProcessing = range.end.seconds }
+        }
+    }
+
+    func photoOutput(_ output: AVCapturePhotoOutput, willCapturePhotoFor resolvedSettings: AVCaptureResolvedPhotoSettings) {
+        exposureStarted = CACurrentMediaTime()
+    }
+
+    func photoOutput(_ output: AVCapturePhotoOutput, didCapturePhotoFor resolvedSettings: AVCaptureResolvedPhotoSettings) {
+        exposureEnded = CACurrentMediaTime()
+        onExposureDone()
     }
 
     func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
+        processingEnded = CACurrentMediaTime()
         guard error == nil, let data = photo.fileDataRepresentation(with: customizer) else { return }
         if photo.isRawPhoto {
             raw = data
@@ -33,6 +64,7 @@ final class PhotoCaptureProcessor: NSObject, AVCapturePhotoCaptureDelegate {
     }
 
     func photoOutput(_ output: AVCapturePhotoOutput, didFinishCaptureFor resolvedSettings: AVCaptureResolvedPhotoSettings, error: Error?) {
+        reportTiming(size: resolvedSettings.photoDimensions)
         if let error {
             onCaptured(false)
             onSaved(false, "Capture failed: \(error.localizedDescription)")
@@ -53,6 +85,20 @@ final class PhotoCaptureProcessor: NSObject, AVCapturePhotoCaptureDelegate {
             onCaptured(false)
             onSaved(false, "Capture failed: no image data")
         }
+    }
+
+    private func reportTiming(size: CMVideoDimensions) {
+        let end = CACurrentMediaTime()
+        func seconds(_ from: CFTimeInterval?, _ to: CFTimeInterval?) -> String {
+            guard let from, let to else { return "?" }
+            return String(format: "%.2fs", to - from)
+        }
+        var text = "waiting for frame \(seconds(requested, exposureStarted)), "
+            + "exposing \(seconds(exposureStarted, exposureEnded)), "
+            + "processing \(seconds(exposureEnded, processingEnded ?? end)), "
+            + "total \(seconds(requested, end)) for \(size.width)×\(size.height)"
+        if let expectedProcessing { text += String(format: " (iOS expected processing up to %.2fs)", expectedProcessing) }
+        onTiming(text)
     }
 }
 

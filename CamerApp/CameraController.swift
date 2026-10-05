@@ -173,6 +173,9 @@ final class CameraController: NSObject, ObservableObject {
 
     @Published var magnifierOn = false
     @Published var isCapturing = false
+    /// Photos whose exposure is done but that iOS is still processing.
+    @Published var processingCount = 0
+    private let lastCaptureTiming = Locked<String>("no photo taken yet")
     @Published var isStacking = false
     @Published var stackFrames = 0
     @Published var stackFrameTarget: Int?
@@ -417,6 +420,8 @@ final class CameraController: NSObject, ObservableObject {
             "ISO \(fmt.minISO)–\(fmt.maxISO), shutter \(Stops.shutterLabel(minExposure))–\(Stops.shutterLabel(maxExposure)), aperture f/\(newDevice.lensAperture)",
             "Bayer RAW: \(hasRAW ? "yes" : "no"), ProRAW: \(hasProRAW ? "yes" : "no")",
             "Max zoom: \(newDevice.maxAvailableVideoZoomFactor)",
+            "Zero shutter lag: supported \(photoOutput.isZeroShutterLagSupported), on \(photoOutput.isZeroShutterLagEnabled); "
+                + "responsive capture: supported \(photoOutput.isResponsiveCaptureSupported), on \(photoOutput.isResponsiveCaptureEnabled)",
         ]
         if #available(iOS 18.0, *) {
             report.append("Camera Control: supported \(session.supportsControls), max controls \(session.maxControlsCount)")
@@ -804,8 +809,18 @@ final class CameraController: NSObject, ObservableObject {
         }
     }
 
+    /// Lets a couple of photos process in the background, but no more, so fast sequences
+    /// don't run the phone out of memory.
+    @MainActor
+    func waitForProcessingRoom(limit: Int = 2) async {
+        while processingCount >= limit {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+    }
+
     func takePictureAsync() async -> Bool {
-        await withCheckedContinuation { continuation in
+        await waitForProcessingRoom()
+        return await withCheckedContinuation { continuation in
             DispatchQueue.main.async {
                 self.takePicture { continuation.resume(returning: $0) }
             }
@@ -890,6 +905,7 @@ final class CameraController: NSObject, ObservableObject {
         rawFramesTask = Task { @MainActor in
             var taken = 0
             while !Task.isCancelled, frames == nil || taken < frames! {
+                await self.waitForProcessingRoom()
                 let ok = await withCheckedContinuation { continuation in
                     self.capturePhoto(formatOverride: rawFormat) { continuation.resume(returning: $0) }
                 }
@@ -946,15 +962,33 @@ final class CameraController: NSObject, ObservableObject {
             }
 
             let id = settings.uniqueID
-            let processor = PhotoCaptureProcessor(gps: gps, location: fix.location, deviceID: deviceID, onCaptured: { success in
+            // Main-thread bookkeeping: the camera counts as free once the exposure is over,
+            // while iOS keeps processing the photo in the background.
+            var released = false
+            var counted = false
+            let release: (Bool) -> Void = { success in
+                guard !released else { return }
+                released = true
+                self.isCapturing = false
+                completion(success)
+            }
+            let processor = PhotoCaptureProcessor(gps: gps, location: fix.location, deviceID: deviceID, onExposureDone: {
+                DispatchQueue.main.async {
+                    counted = true
+                    self.processingCount += 1
+                    release(true)
+                }
+            }, onCaptured: { success in
                 self.sessionQueue.async { self.inFlight[id] = nil }
                 DispatchQueue.main.async {
-                    self.isCapturing = false
+                    if counted { self.processingCount -= 1 }
                     if let device = self.uiDevice { self.lensInfo = Metadata.lensInfo(for: device) }
-                    completion(success)
+                    release(success)
                 }
             }, onSaved: { _, message in
                 self.show(message)
+            }, onTiming: { timing in
+                self.lastCaptureTiming.set(timing)
             })
             self.inFlight[id] = processor
             if let failure = Diagnostics.guarded("capture", { self.photoOutput.capturePhoto(with: settings, delegate: processor) }) {
@@ -1033,6 +1067,7 @@ final class CameraController: NSObject, ObservableObject {
             sessionReport.get(),
             cameraControlsReport(),
             "Video frames (used for stacks): \(frameProcessor.frameSize.get())",
+            "Last photo timing: \(lastCaptureTiming.get())",
             "Format \(format.rawValue), photo size \(outputMegapixels) MP (preferred \(preferredMegapixels)), stack mode \(stackMode.rawValue) → \(longExposureOutput)",
             "ISO \(autoISO ? "auto" : "manual") \(Int(iso)), shutter \(autoShutter ? "auto" : "manual") \(bulb ? "BULB" : Stops.shutterLabel(exposureSeconds)), EV \(Stops.evLabel(evBias)), zoom \(String(format: "%.1f", zoomFactor))×",
             "Focus \(autoFocus ? "auto" : "manual") \(String(format: "%.2f", lensPosition)), WB \(autoWhiteBalance ? "auto" : "manual") \(Int(whiteBalanceKelvin))K",
