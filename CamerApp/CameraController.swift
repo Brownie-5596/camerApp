@@ -235,7 +235,9 @@ final class CameraController: NSObject, ObservableObject {
             DispatchQueue.main.async { self.lenses = options }
 
             if let initial = devices.first(where: { $0.deviceType == .builtInWideAngleCamera }) ?? devices.first {
-                self.switchTo(initial)
+                if let failure = Diagnostics.guarded("lens setup", { self.switchTo(initial) }) {
+                    DispatchQueue.main.async { self.show(failure) }
+                }
             }
 
             // Safety net: if setting up Camera Control crashed the app last time, skip it this time.
@@ -245,7 +247,9 @@ final class CameraController: NSObject, ObservableObject {
                 defaults.set(true, forKey: "controlsSetupInProgress")
                 defaults.synchronize()
                 let controls = CameraControlsManager(camera: self, lenses: options)
-                controls.install(on: self.session)
+                if let failure = Diagnostics.guarded("Camera Control setup", { controls.install(on: self.session) }) {
+                    DispatchQueue.main.async { self.show(failure) }
+                }
                 self.cameraControls = controls
             }
 
@@ -289,7 +293,10 @@ final class CameraController: NSObject, ObservableObject {
     func selectLens(_ id: String) {
         guard id != currentLensID, !isStacking else { return }
         sessionQueue.async {
-            if let d = self.devicesByID[id] { self.switchTo(d) }
+            if let d = self.devicesByID[id],
+               let failure = Diagnostics.guarded("lens switch", { self.switchTo(d) }) {
+                DispatchQueue.main.async { self.show(failure) }
+            }
         }
     }
 
@@ -495,8 +502,9 @@ final class CameraController: NSObject, ObservableObject {
             guard let d = self.device else { return }
             do {
                 try d.lockForConfiguration()
-                body(d)
+                let failure = Diagnostics.guarded("camera setting") { body(d) }
                 d.unlockForConfiguration()
+                if let failure { DispatchQueue.main.async { self.show(failure) } }
             } catch {
                 DispatchQueue.main.async { self.show("Couldn't change camera settings") }
             }
@@ -609,7 +617,16 @@ final class CameraController: NSObject, ObservableObject {
 
         if d.focusMode != .locked { lensPosition = d.lensPosition }
         if autoWhiteBalance {
-            let t = d.temperatureAndTintValues(for: d.deviceWhiteBalanceGains).temperature
+            // Gains outside 1...max make AVFoundation throw, so clamp before converting.
+            var gains = d.deviceWhiteBalanceGains
+            let maxGain = d.maxWhiteBalanceGain
+            gains.redGain = min(max(gains.redGain, 1), maxGain)
+            gains.greenGain = min(max(gains.greenGain, 1), maxGain)
+            gains.blueGain = min(max(gains.blueGain, 1), maxGain)
+            var t: Float = .nan
+            Diagnostics.guarded("white balance readout") {
+                t = d.temperatureAndTintValues(for: gains).temperature
+            }
             if t.isFinite { whiteBalanceKelvin = t }
         }
         if lightningArmed {
@@ -787,7 +804,14 @@ final class CameraController: NSObject, ObservableObject {
                 self.show(message)
             })
             self.inFlight[id] = processor
-            self.photoOutput.capturePhoto(with: settings, delegate: processor)
+            if let failure = Diagnostics.guarded("capture", { self.photoOutput.capturePhoto(with: settings, delegate: processor) }) {
+                self.inFlight[id] = nil
+                DispatchQueue.main.async {
+                    self.isCapturing = false
+                    self.show(failure)
+                    completion(false)
+                }
+            }
         }
     }
 

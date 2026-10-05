@@ -19,4 +19,5 @@ targets:
         INFOPLIST_FILE: CamerApp/Info.plist
         TARGETED_DEVICE_FAMILY: "1"
         GENERATE_INFOPLIST_FILE: NO
+        SWIFT_OBJC_BRIDGING_HEADER: CamerApp/CamerApp-Bridging-Header.h
     scheme: {}

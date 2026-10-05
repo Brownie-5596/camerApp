@@ -23,6 +23,7 @@ struct ContentView: View {
     @State private var tapPoint: CGPoint?
     @State private var burstTask: Task<Void, Never>?
     @State private var burstCount = 0
+    @State private var lastCrash: String? = Diagnostics.takeLastCrash()
 
     private var theme: Theme { Theme(redMode: redMode) }
 
@@ -65,6 +66,13 @@ struct ContentView: View {
             IntervalometerView(intervalometer: intervalometer, camera: camera, theme: theme)
                 .presentationDetents([.medium])
                 .presentationBackground(.black)
+        }
+        .alert("CamerApp crashed last time", isPresented: Binding(get: { lastCrash != nil },
+                                                                  set: { if !$0 { lastCrash = nil } })) {
+            Button("Copy details") { UIPasteboard.general.string = lastCrash }
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text((lastCrash ?? "") + "\n\nTap Copy details and paste it to Claude.")
         }
         .sheet(isPresented: $showPresets) {
             PresetsSheet(camera: camera, theme: theme)
