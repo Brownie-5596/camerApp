@@ -17,6 +17,9 @@ final class FrameProcessor: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
     typealias MetadataBuilder = (_ frames: Int, _ width: Int, _ height: Int) -> [String: Any]
 
     private let ciContext = CIContext(options: [.cacheIntermediates: false])
+    /// Size of the incoming frames, e.g. "4032×3024", for the camera report.
+    let frameSize = Locked<String>("no frames yet")
+    private var lastFrameWidth = 0
 
     private final class StackJob {
         let stacker: Stacker
@@ -125,6 +128,10 @@ final class FrameProcessor: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
                               width: CVPixelBufferGetWidth(pixelBuffer),
                               height: CVPixelBufferGetHeight(pixelBuffer),
                               bytesPerRow: CVPixelBufferGetBytesPerRow(pixelBuffer))
+        if frame.width != lastFrameWidth {
+            lastFrameWidth = frame.width
+            frameSize.set("\(frame.width)×\(frame.height)")
+        }
 
         if let job {
             job.stacker.add(frame)

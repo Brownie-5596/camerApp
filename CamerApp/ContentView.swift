@@ -25,6 +25,8 @@ struct ContentView: View {
     @State private var burstTask: Task<Void, Never>?
     @State private var burstCount = 0
     @State private var lastCrash: String? = Diagnostics.takeLastCrash()
+    /// How far the screen is turned from portrait, in degrees clockwise (for the level).
+    @State private var interfaceRotation: Double = 0
 
     private var theme: Theme { Theme(redMode: redMode) }
 
@@ -34,28 +36,26 @@ struct ContentView: View {
     }
 
     var body: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
-            if camera.permissionDenied {
-                Text("Camera access is off.\nTurn it on in Settings → Privacy & Security → Camera.")
-                    .multilineTextAlignment(.center)
-                    .foregroundStyle(theme.primary)
-                    .padding()
-            } else {
-                VStack(spacing: 10) {
-                    topBar
-                    preview
-                    MeterRow(camera: camera, theme: theme)
-                    SettingsPanel(camera: camera, selected: $selectedSetting, theme: theme)
-                    lensPicker
-                    bottomBar
+        GeometryReader { geometry in
+            let landscape = geometry.size.width > geometry.size.height
+            ZStack {
+                Color.black.ignoresSafeArea()
+                if camera.permissionDenied {
+                    Text("Camera access is off.\nTurn it on in Settings → Privacy & Security → Camera.")
+                        .multilineTextAlignment(.center)
+                        .foregroundStyle(theme.primary)
+                        .padding()
+                } else if landscape {
+                    landscapeLayout
+                } else {
+                    portraitLayout
                 }
-                .padding(.horizontal, 12)
-                .padding(.bottom, 8)
             }
+            .onChange(of: landscape) { _, _ in updateInterfaceRotation() }
         }
         .tint(theme.accent)
         .onAppear {
+            updateInterfaceRotation()
             camera.start()
             level.start()
             camera.setPeaking(peaking, redMode: redMode)
@@ -83,6 +83,72 @@ struct ContentView: View {
             SettingsSheet(camera: camera, theme: theme, showGrid: $showGrid, showLevel: $showLevel,
                           showHistogram: $showHistogram, peaking: $peaking)
                 .presentationBackground(.black)
+        }
+    }
+
+    private var portraitLayout: some View {
+        VStack(spacing: 8) {
+            topBar
+            statusLine
+            preview(aspectRatio: 3.0 / 4.0)
+            MeterRow(camera: camera, theme: theme)
+            SettingsPanel(camera: camera, selected: $selectedSetting, theme: theme)
+            HStack(spacing: 12) {
+                modesButton
+                Spacer()
+                ForEach(camera.lenses) { lensButton($0) }
+                Spacer()
+                Color.clear.frame(width: 56, height: 32)
+            }
+            HStack {
+                intervalometerButton
+                Spacer()
+                shutterButton
+                Spacer()
+                selfTimerButton
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.bottom, 8)
+    }
+
+    /// Landscape: lenses on the left, preview in the middle, dials and shutter on the right.
+    private var landscapeLayout: some View {
+        HStack(spacing: 10) {
+            VStack(spacing: 10) {
+                modesButton
+                ForEach(camera.lenses) { lensButton($0) }
+                Spacer(minLength: 0)
+                intervalometerButton
+                selfTimerButton
+            }
+            .frame(width: 60)
+
+            VStack(spacing: 6) {
+                topBar
+                statusLine
+                preview(aspectRatio: 4.0 / 3.0)
+            }
+
+            VStack(spacing: 8) {
+                MeterRow(camera: camera, theme: theme)
+                SettingsPanel(camera: camera, selected: $selectedSetting, theme: theme)
+                Spacer(minLength: 0)
+                shutterButton
+                Spacer(minLength: 0)
+            }
+            .frame(width: 250)
+        }
+        .padding(.vertical, 6)
+    }
+
+    private func updateInterfaceRotation() {
+        let scene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
+        switch scene?.interfaceOrientation {
+        case .landscapeLeft: interfaceRotation = 90
+        case .landscapeRight: interfaceRotation = -90
+        case .portraitUpsideDown: interfaceRotation = 180
+        default: interfaceRotation = 0
         }
     }
 
@@ -122,7 +188,7 @@ struct ContentView: View {
     // MARK: - Top bar
 
     private var topBar: some View {
-        HStack(spacing: 14) {
+        HStack(spacing: 6) {
             chip(camera.format.rawValue) {
                 let options = OutputFormat.allCases.filter { format in
                     switch format {
@@ -135,39 +201,46 @@ struct ContentView: View {
                     camera.format = options[(i + 1) % options.count]
                 }
             }
-            if let label = camera.highResolutionLabel {
-                chip(camera.useHighResolution ? label.replacingOccurrences(of: " ", with: "") : "12MP") {
-                    camera.useHighResolution.toggle()
-                    camera.show(camera.useHighResolution ? "Full resolution (\(label))" : "Standard resolution (12 MP)")
+            if camera.availableMegapixels.count > 1 {
+                chip("\(camera.effectiveMegapixels)MP") {
+                    let choices = camera.availableMegapixels
+                    let i = choices.firstIndex(of: camera.effectiveMegapixels) ?? 0
+                    camera.preferredMegapixels = choices[(i + 1) % choices.count]
+                    camera.show("Photo size \(camera.effectiveMegapixels) MP")
                 }
             }
             chip(camera.stackMode.shortName) {
                 let modes = StackMode.allCases
                 if let i = modes.firstIndex(of: camera.stackMode) {
                     camera.stackMode = modes[(i + 1) % modes.count]
-                    camera.show("Stacking: \(camera.stackMode.rawValue)")
+                    camera.show("Long exposures: \(camera.stackMode.rawValue)")
                 }
             }
-            Spacer()
-            iconButton(camera.lightningArmed ? "bolt.fill" : "bolt", active: camera.lightningArmed) {
-                camera.setLightning(!camera.lightningArmed)
+            Spacer(minLength: 4)
+            HStack(spacing: 2) {
+                iconButton(camera.lightningArmed ? "bolt.fill" : "bolt", active: camera.lightningArmed) {
+                    camera.setLightning(!camera.lightningArmed)
+                }
+                .disabled(camera.isStacking)
+                iconButton("scope", active: peaking) { peaking.toggle() }
+                iconButton("plus.magnifyingglass", active: camera.magnifierOn) {
+                    camera.setMagnifier(!camera.magnifierOn)
+                }
+                iconButton(redMode ? "eye.fill" : "eye", active: redMode) { redMode.toggle() }
+                iconButton("gearshape", active: false) { showSettings = true }
             }
-            .disabled(camera.isStacking)
-            iconButton("scope", active: peaking) { peaking.toggle() }
-            iconButton("plus.magnifyingglass", active: camera.magnifierOn) {
-                camera.setMagnifier(!camera.magnifierOn)
-            }
-            iconButton(redMode ? "eye.fill" : "eye", active: redMode) { redMode.toggle() }
-            iconButton("gearshape", active: false) { showSettings = true }
         }
+        .lineLimit(1)
         .foregroundStyle(theme.primary)
     }
 
     private func chip(_ title: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Text(title)
-                .font(.system(.caption, design: .monospaced).bold())
-                .padding(.horizontal, 8)
+                .font(.system(.caption2, design: .monospaced).bold())
+                .lineLimit(1)
+                .fixedSize()
+                .padding(.horizontal, 7)
                 .padding(.vertical, 5)
                 .overlay(Capsule().stroke(theme.primary, lineWidth: 1))
         }
@@ -176,15 +249,27 @@ struct ContentView: View {
     private func iconButton(_ symbol: String, active: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: symbol)
-                .font(.system(size: 17))
-                .frame(width: 28, height: 32)
+                .font(.system(size: 16))
+                .frame(width: 30, height: 30)
         }
         .foregroundStyle(active ? theme.accent : theme.primary)
     }
 
+    /// One line under the top bar for everything the camera is telling you.
+    private var statusLine: some View {
+        let parts = [statusText, camera.lastMessage].compactMap { $0 }
+        return Text(parts.isEmpty ? " " : parts.joined(separator: "  ·  "))
+            .font(.caption.monospacedDigit())
+            .lineLimit(1)
+            .truncationMode(.middle)
+            .foregroundStyle(camera.lastMessage != nil ? theme.accent : theme.primary)
+            .frame(maxWidth: .infinity)
+            .frame(height: 16)
+    }
+
     // MARK: - Preview
 
-    private var preview: some View {
+    private func preview(aspectRatio: CGFloat) -> some View {
         ZStack {
             CameraPreview(camera: camera, redMode: redMode, onShutterEvent: shutter)
                 .onTapGesture { location in
@@ -213,7 +298,7 @@ struct ContentView: View {
                     GridOverlay(color: theme.primary.opacity(0.35))
                 }
                 if showLevel {
-                    LevelOverlay(level: level, theme: theme)
+                    LevelOverlay(level: level, theme: theme, interfaceRotation: interfaceRotation)
                 }
                 if let point = tapPoint {
                     RoundedRectangle(cornerRadius: 4)
@@ -224,17 +309,12 @@ struct ContentView: View {
             }
             .allowsHitTesting(false)
         }
-        .aspectRatio(3.0 / 4.0, contentMode: .fit)
+        .aspectRatio(aspectRatio, contentMode: .fit)
         .overlay(alignment: .topLeading) {
             if showHistogram && !camera.histogram.isEmpty {
                 HistogramView(bins: camera.histogram, color: theme.primary)
                     .padding(8)
                     .allowsHitTesting(false)
-            }
-        }
-        .overlay(alignment: .top) {
-            if let status = statusText {
-                badge(status).padding(.top, showHistogram ? 58 : 0)
             }
         }
         .overlay(alignment: .topTrailing) {
@@ -250,11 +330,6 @@ struct ContentView: View {
                 }
                 .foregroundStyle(theme.accent)
                 .padding(8)
-            }
-        }
-        .overlay(alignment: .bottom) {
-            if let message = camera.lastMessage {
-                badge(message)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -285,78 +360,60 @@ struct ContentView: View {
         return nil
     }
 
-    private func badge(_ text: String) -> some View {
-        Text(text)
-            .font(.footnote.monospacedDigit())
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-            .background(Color.black.opacity(0.65), in: Capsule())
-            .foregroundStyle(theme.primary)
-            .padding(8)
-            .allowsHitTesting(false)
-    }
-
     // MARK: - Bottom
 
-    private var lensPicker: some View {
-        HStack(spacing: 12) {
-            Button {
-                showPresets = true
-            } label: {
-                Text("MODES")
-                    .font(.system(.caption2, design: .monospaced).bold())
-                    .frame(width: 56, height: 32)
-                    .overlay(Capsule().stroke(theme.primary, lineWidth: 1))
-            }
-            .foregroundStyle(theme.primary)
-            Spacer()
-            ForEach(camera.lenses) { lens in
-                Button {
-                    camera.selectLens(lens.id)
-                } label: {
-                    Text(lens.name)
-                        .font(.footnote.bold())
-                        .frame(width: 44, height: 44)
-                        .background(Circle().fill(Color.white.opacity(0.12)))
-                }
-                .foregroundStyle(lens.id == camera.currentLensID ? theme.accent : theme.primary)
-            }
-            Spacer()
-            Color.clear.frame(width: 56, height: 32)
+    private var modesButton: some View {
+        Button {
+            showPresets = true
+        } label: {
+            Text("MODES")
+                .font(.system(.caption2, design: .monospaced).bold())
+                .fixedSize()
+                .frame(width: 56, height: 32)
+                .overlay(Capsule().stroke(theme.primary, lineWidth: 1))
         }
+        .foregroundStyle(theme.primary)
     }
 
-    private var bottomBar: some View {
-        HStack {
-            Button {
-                showIntervalometer = true
-            } label: {
-                Image(systemName: "timelapse")
-                    .font(.title2)
-                    .frame(width: 56, height: 56)
-            }
-            .foregroundStyle(intervalometer.isRunning ? theme.accent : theme.primary)
-
-            Spacer()
-            shutterButton
-            Spacer()
-
-            Button {
-                let options = [0, 2, 10]
-                let i = options.firstIndex(of: camera.selfTimerSeconds) ?? 0
-                camera.selfTimerSeconds = options[(i + 1) % options.count]
-                camera.show(camera.selfTimerSeconds == 0 ? "Self-timer off" : "Self-timer \(camera.selfTimerSeconds)s")
-            } label: {
-                VStack(spacing: 0) {
-                    Image(systemName: "timer").font(.title2)
-                    if camera.selfTimerSeconds > 0 {
-                        Text("\(camera.selfTimerSeconds)s").font(.caption2.bold())
-                    }
-                }
-                .frame(width: 56, height: 56)
-            }
-            .foregroundStyle(camera.selfTimerSeconds > 0 ? theme.accent : theme.primary)
+    private func lensButton(_ lens: LensOption) -> some View {
+        Button {
+            camera.selectLens(lens.id)
+        } label: {
+            Text(lens.name)
+                .font(.footnote.bold())
+                .frame(width: 44, height: 44)
+                .background(Circle().fill(Color.white.opacity(0.12)))
         }
+        .foregroundStyle(lens.id == camera.currentLensID ? theme.accent : theme.primary)
+    }
+
+    private var intervalometerButton: some View {
+        Button {
+            showIntervalometer = true
+        } label: {
+            Image(systemName: "timelapse")
+                .font(.title2)
+                .frame(width: 56, height: 56)
+        }
+        .foregroundStyle(intervalometer.isRunning ? theme.accent : theme.primary)
+    }
+
+    private var selfTimerButton: some View {
+        Button {
+            let options = [0, 2, 10]
+            let i = options.firstIndex(of: camera.selfTimerSeconds) ?? 0
+            camera.selfTimerSeconds = options[(i + 1) % options.count]
+            camera.show(camera.selfTimerSeconds == 0 ? "Self-timer off" : "Self-timer \(camera.selfTimerSeconds)s")
+        } label: {
+            VStack(spacing: 0) {
+                Image(systemName: "timer").font(.title2)
+                if camera.selfTimerSeconds > 0 {
+                    Text("\(camera.selfTimerSeconds)s").font(.caption2.bold())
+                }
+            }
+            .frame(width: 56, height: 56)
+        }
+        .foregroundStyle(camera.selfTimerSeconds > 0 ? theme.accent : theme.primary)
     }
 
     private var stackProgress: Double {

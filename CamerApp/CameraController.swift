@@ -55,8 +55,12 @@ final class CameraController: NSObject, ObservableObject {
     private var devicesByID: [String: AVCaptureDevice] = [:]
     private var rawFormatType: OSType?
     private var proRAWFormatType: OSType?
-    private var standardPhotoDimensions: CMVideoDimensions?
-    private var largestPhotoDimensions: CMVideoDimensions?
+    /// Photo sizes this lens offers, keyed by megapixels (12, 24, 48…).
+    private var photoDimensionsByMP: [Int: CMVideoDimensions] = [:]
+    /// Technical summary of the current lens setup, for the camera report.
+    private let sessionReport = Locked<String>("Camera not started")
+    private var previewRotationObservation: NSKeyValueObservation?
+    private var peakingSettings = (on: false, redMode: false)
     private var inFlight: [Int64: PhotoCaptureProcessor] = [:]
     private var cameraControls: AnyObject?
 
@@ -112,8 +116,9 @@ final class CameraController: NSObject, ObservableObject {
         }
     }
     /// Full sensor resolution (48 MP on Pro iPhones) for HEIF photos.
-    @Published var useHighResolution = false {
-        didSet { UserDefaults.standard.set(useHighResolution, forKey: "highResolution") }
+    /// Preferred photo size in megapixels. Lenses that can't do it use the nearest smaller size.
+    @Published var preferredMegapixels = 12 {
+        didSet { UserDefaults.standard.set(preferredMegapixels, forKey: "megapixels") }
     }
     @Published var saveLocation = true {
         didSet {
@@ -123,7 +128,8 @@ final class CameraController: NSObject, ObservableObject {
     }
     @Published var rawSupported = false
     /// e.g. "48 MP" when the lens can shoot above 12 MP.
-    @Published var highResolutionLabel: String?
+    /// Photo sizes the current lens offers, e.g. [12, 24, 48].
+    @Published var availableMegapixels: [Int] = [12]
     @Published var proRAWSupported = false
     /// Digital zoom on top of the selected lens (pinch the preview).
     @Published var zoomFactor: CGFloat = 1
@@ -156,7 +162,11 @@ final class CameraController: NSObject, ObservableObject {
         stackMode = StackMode(rawValue: defaults.string(forKey: "stackMode") ?? "") ?? .longExposure
         selfTimerSeconds = defaults.integer(forKey: "selfTimer")
         lightningSensitivity = LightningSensitivity(rawValue: defaults.string(forKey: "lightningSensitivity") ?? "") ?? .medium
-        useHighResolution = defaults.bool(forKey: "highResolution")
+        if defaults.object(forKey: "megapixels") != nil {
+            preferredMegapixels = defaults.integer(forKey: "megapixels")
+        } else if defaults.bool(forKey: "highResolution") {
+            preferredMegapixels = 48
+        }
         cameraControlFullStops = defaults.bool(forKey: "controlFullStops")
         if defaults.object(forKey: "saveLocation") != nil {
             saveLocation = defaults.bool(forKey: "saveLocation")
@@ -240,6 +250,10 @@ final class CameraController: NSObject, ObservableObject {
             }
             self.videoOutput.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
             self.videoOutput.alwaysDiscardsLateVideoFrames = true
+            // In the photo preset iOS otherwise shrinks these frames to preview size (~2 MP),
+            // which is what stacked shots are built from. Ask for the full sensor readout instead.
+            self.videoOutput.automaticallyConfiguresOutputBufferDimensions = false
+            self.videoOutput.deliversPreviewSizedOutputBuffers = false
             self.videoOutput.setSampleBufferDelegate(self.frameProcessor, queue: self.frameProcessor.queue)
             if self.session.canAddOutput(self.videoOutput) {
                 self.session.addOutput(self.videoOutput)
@@ -336,15 +350,14 @@ final class CameraController: NSObject, ObservableObject {
         let photoDimensions = newDevice.activeFormat.supportedMaxPhotoDimensions
         let area: (CMVideoDimensions) -> Int = { Int($0.width) * Int($0.height) }
         let largest = photoDimensions.max { area($0) < area($1) }
-        let standard = photoDimensions.filter { area($0) <= 13_000_000 }.max { area($0) < area($1) }
-            ?? photoDimensions.min { area($0) < area($1) }
         if let largest { photoOutput.maxPhotoDimensions = largest }
-        largestPhotoDimensions = largest
-        standardPhotoDimensions = standard
-        let highResLabel: String? = {
-            guard let largest, let standard, area(largest) > area(standard) else { return nil }
-            return "\(Int((Double(area(largest)) / 1_000_000).rounded())) MP"
-        }()
+        // 8064 × 6048 is 48.8 million pixels; Apple calls it 48 MP, so round down.
+        var byMP: [Int: CMVideoDimensions] = [:]
+        for dimensions in photoDimensions {
+            byMP[area(dimensions) / 1_000_000] = dimensions
+        }
+        photoDimensionsByMP = byMP
+        let megapixelChoices = byMP.keys.sorted()
 
         // Bayer RAW (plain DNG), not Apple ProRAW.
         if photoOutput.isAppleProRAWSupported { photoOutput.isAppleProRAWEnabled = true }
@@ -360,6 +373,24 @@ final class CameraController: NSObject, ObservableObject {
         let maxExposure = fmt.maxExposureDuration.seconds
         let shutterStops = Stops.shutterStops(minExposure: minExposure, maxExposure: maxExposure)
 
+        let describe: (CMVideoDimensions) -> String = { "\($0.width)×\($0.height)" }
+        let formatSize = CMVideoFormatDescriptionGetDimensions(fmt.formatDescription)
+        let frameRates = fmt.videoSupportedFrameRateRanges.map { String(format: "%.0f–%.0f fps", $0.minFrameRate, $0.maxFrameRate) }
+        var report = [
+            "Lens: \(newDevice.localizedName) (\(newDevice.deviceType.rawValue))",
+            "Session preset: \(session.sessionPreset.rawValue)",
+            "Active format: \(describe(formatSize)), \(frameRates.joined(separator: ", ")), FOV \(fmt.videoFieldOfView)°",
+            "Photo sizes: \(photoDimensions.map(describe).joined(separator: ", "))",
+            "Photo output max: \(describe(photoOutput.maxPhotoDimensions))",
+            "ISO \(fmt.minISO)–\(fmt.maxISO), shutter \(Stops.shutterLabel(minExposure))–\(Stops.shutterLabel(maxExposure)), aperture f/\(newDevice.lensAperture)",
+            "Bayer RAW: \(hasRAW ? "yes" : "no"), ProRAW: \(hasProRAW ? "yes" : "no")",
+            "Max zoom: \(newDevice.maxAvailableVideoZoomFactor)",
+        ]
+        if #available(iOS 18.0, *) {
+            report.append("Camera Control: supported \(session.supportsControls), max controls \(session.maxControlsCount), installed \(session.controls.count)")
+        }
+        sessionReport.set(report.joined(separator: "\n"))
+
         DispatchQueue.main.async {
             self.uiDevice = newDevice
             self.lensInfo = Metadata.lensInfo(for: newDevice)
@@ -370,7 +401,7 @@ final class CameraController: NSObject, ObservableObject {
             self.minDeviceExposure = minExposure
             self.maxDeviceExposure = maxExposure
             self.shutterStops = shutterStops
-            self.highResolutionLabel = highResLabel
+            self.availableMegapixels = megapixelChoices.isEmpty ? [12] : megapixelChoices
             self.proRAWSupported = hasProRAW
             self.zoomFactor = 1
             self.maxZoomFactor = maxZoom
@@ -385,9 +416,11 @@ final class CameraController: NSObject, ObservableObject {
 
             let coordinator = AVCaptureDevice.RotationCoordinator(device: newDevice, previewLayer: self.previewLayer)
             self.rotationCoordinator = coordinator
-            let previewAngle = coordinator.videoRotationAngleForHorizonLevelPreview
-            if let connection = self.previewLayer.connection, connection.isVideoRotationAngleSupported(previewAngle) {
-                connection.videoRotationAngle = previewAngle
+            // Keep the preview upright as the screen rotates between portrait and landscape.
+            self.previewRotationObservation = coordinator.observe(\.videoRotationAngleForHorizonLevelPreview,
+                                                                  options: [.initial, .new]) { [weak self] coordinator, _ in
+                let angle = coordinator.videoRotationAngleForHorizonLevelPreview
+                DispatchQueue.main.async { self?.applyPreviewRotation(angle) }
             }
 
             self.applyExposure()
@@ -812,7 +845,8 @@ final class CameraController: NSObject, ObservableObject {
     private func startRAWFrames(completion: @escaping (Bool) -> Void) {
         if lightningArmed { setLightning(false) }
         let frames = plannedFrames
-        let rawFormat: OutputFormat = proRAWSupported ? .proRAW : .raw
+        // Follow the chosen format if it's a RAW one; otherwise use the best RAW available.
+        let rawFormat: OutputFormat = format == .raw || !proRAWSupported ? .raw : .proRAW
         isStacking = true
         stackFrames = 0
         stackFrameTarget = frames
@@ -837,7 +871,14 @@ final class CameraController: NSObject, ObservableObject {
 
     private func capturePhoto(formatOverride: OutputFormat? = nil, completion: @escaping (Bool) -> Void) {
         let format = formatOverride ?? self.format
-        let highResolution = useHighResolution && (format == .heif || format == .proRAW)
+        // Plain (Bayer) RAW is a 12 MP readout; ProRAW comes in 12 or 48 MP; HEIF in any size.
+        let megapixels: Int
+        switch format {
+        case .raw, .rawPlusHEIF: megapixels = availableMegapixels.first ?? 12
+        case .proRAW: megapixels = effectiveMegapixels > 12 ? (availableMegapixels.last ?? 12) : (availableMegapixels.first ?? 12)
+        case .heif: megapixels = effectiveMegapixels
+        }
+        let highResolution = megapixels > 13
         let angle = rotationCoordinator?.videoRotationAngleForHorizonLevelCapture
         let fix = location.snapshot(enabled: saveLocation)
         let gps = fix.location.map { Metadata.gps(location: $0, heading: fix.heading) }
@@ -861,7 +902,7 @@ final class CameraController: NSObject, ObservableObject {
             } else {
                 settings = AVCapturePhotoSettings()
             }
-            if let dimensions = highResolution ? self.largestPhotoDimensions : self.standardPhotoDimensions {
+            if let dimensions = self.photoDimensionsByMP[megapixels] {
                 settings.maxPhotoDimensions = dimensions
             }
             // .speed keeps a single frame (the exposure you set is the exposure you get), but iOS
@@ -900,8 +941,37 @@ final class CameraController: NSObject, ObservableObject {
     // MARK: - Live view helpers
 
     func setPeaking(_ on: Bool, redMode: Bool) {
+        peakingSettings = (on, redMode)
         let angle = rotationCoordinator?.videoRotationAngleForHorizonLevelPreview ?? 90
         frameProcessor.setPeaking(enabled: on, orientation: Stops.orientation(forRotationAngle: angle), redMode: redMode)
+    }
+
+    private func applyPreviewRotation(_ angle: CGFloat) {
+        if let connection = previewLayer.connection, connection.isVideoRotationAngleSupported(angle) {
+            connection.videoRotationAngle = angle
+        }
+        setPeaking(peakingSettings.on, redMode: peakingSettings.redMode)
+    }
+
+    /// The size photos will actually be, given the preference and what this lens can do.
+    var effectiveMegapixels: Int {
+        availableMegapixels.filter { $0 <= preferredMegapixels }.max() ?? availableMegapixels.first ?? 12
+    }
+
+    /// Everything useful for diagnosing problems remotely, to paste into a chat.
+    func cameraReport() -> String {
+        var lines = [
+            "\(Metadata.software) on \(Metadata.deviceModel), iOS \(UIDevice.current.systemVersion)",
+            sessionReport.get(),
+            "Video frames (used for stacks): \(frameProcessor.frameSize.get())",
+            "Format \(format.rawValue), resolution \(effectiveMegapixels) MP (preferred \(preferredMegapixels)), stack mode \(stackMode.rawValue)",
+            "ISO \(autoISO ? "auto" : "manual") \(Int(iso)), shutter \(autoShutter ? "auto" : "manual") \(bulb ? "BULB" : Stops.shutterLabel(exposureSeconds)), EV \(Stops.evLabel(evBias)), zoom \(String(format: "%.1f", zoomFactor))×",
+            "Focus \(autoFocus ? "auto" : "manual") \(String(format: "%.2f", lensPosition)), WB \(autoWhiteBalance ? "auto" : "manual") \(Int(whiteBalanceKelvin))K",
+        ]
+        if let error = UserDefaults.standard.string(forKey: "diagnostics.lastError") {
+            lines.append("Last caught error: \(error)")
+        }
+        return lines.joined(separator: "\n")
     }
 
     func setLightning(_ on: Bool) {

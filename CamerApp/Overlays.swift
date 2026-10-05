@@ -23,9 +23,11 @@ struct GridOverlay: View {
 struct LevelOverlay: View {
     @ObservedObject var level: LevelMonitor
     let theme: Theme
+    /// How far the screen itself is rotated (landscape UI), so the line is drawn relative to it.
+    var interfaceRotation: Double = 0
 
     var body: some View {
-        let roll = level.rollDegrees
+        let roll = level.rollDegrees - interfaceRotation
         let nearest = (roll / 90).rounded() * 90
         let isLevel = abs(roll - nearest) < 1
         ZStack {

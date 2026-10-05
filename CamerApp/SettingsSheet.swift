@@ -27,11 +27,18 @@ struct SettingsSheet: View {
                          : "This lens doesn't offer RAW.")
                 }
 
-                if let label = camera.highResolutionLabel {
+                if camera.availableMegapixels.count > 1 {
                     Section {
-                        Toggle("Full resolution (\(label))", isOn: $camera.useHighResolution)
+                        Picker("Photo size", selection: $camera.preferredMegapixels) {
+                            ForEach(camera.availableMegapixels, id: \.self) { mp in
+                                Text("\(mp) MP").tag(mp)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                    } header: {
+                        Text("Resolution")
                     } footer: {
-                        Text("Uses the whole \(label) sensor for HEIF and ProRAW photos (also the 12MP/48MP chip at the top). Plain RAW is always 12 MP, and blended long exposures use the video stream, so they are lower resolution; use the RAW frames mode for full-resolution stars.")
+                        Text("All sizes use the full width of the sensor; nothing is cropped (keep zoom at 1×). HEIF can be any size. ProRAW is 12 or 48 MP. Plain RAW is always 12 MP. Also on the MP chip at the top.")
                     }
                 }
 
@@ -78,6 +85,17 @@ struct SettingsSheet: View {
                     Text("Lightning trigger")
                 } footer: {
                     Text("Tap the bolt to start watching. Whenever the sky suddenly brightens, the app saves the brightest parts of the next half second. A shutter around 1/15 to 1/4 works well.")
+                }
+
+                Section {
+                    Button("Copy camera report") {
+                        UIPasteboard.general.string = camera.cameraReport()
+                        camera.show("Camera report copied")
+                    }
+                } header: {
+                    Text("Troubleshooting")
+                } footer: {
+                    Text("Copies technical details about your camera and the app's settings. Paste it to Claude to help diagnose problems.")
                 }
 
                 Section("Display") {

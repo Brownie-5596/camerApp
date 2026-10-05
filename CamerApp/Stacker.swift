@@ -70,30 +70,59 @@ final class Stacker {
         accumulator?.deallocate()
     }
 
+    /// Frames bigger than this are halved in each direction (2×2 average) so a stack never needs
+    /// more than ~200 MB of memory.
+    private static let maxPixels = 16_000_000
+    private var step = 1
+    private var sourceWidth = 0
+    private var sourceHeight = 0
+
     func add(_ frame: FrameView) {
         if accumulator == nil {
-            width = frame.width
-            height = frame.height
+            sourceWidth = frame.width
+            sourceHeight = frame.height
+            step = frame.width * frame.height > Self.maxPixels ? 2 : 1
+            width = frame.width / step
+            height = frame.height / step
             let size = width * height * 4
             let buffer = UnsafeMutablePointer<Float>.allocate(capacity: size)
             buffer.initialize(repeating: 0, count: size)
             accumulator = buffer
         }
-        guard let acc = accumulator, frame.width == width, frame.height == height else { return }
+        guard let acc = accumulator, frame.width == sourceWidth, frame.height == sourceHeight else { return }
 
         let rowLength = width * 4
+        let brightest = mode == .brightest
         Self.toLinear.withUnsafeBufferPointer { lut in
             for y in 0..<height {
-                let src = frame.base + y * frame.bytesPerRow
                 let dst = acc + y * rowLength
-                if mode == .brightest {
-                    for i in 0..<rowLength {
-                        let v = lut[Int(src[i])]
-                        if v > dst[i] { dst[i] = v }
+                if step == 1 {
+                    let src = frame.base + y * frame.bytesPerRow
+                    if brightest {
+                        for i in 0..<rowLength {
+                            let v = lut[Int(src[i])]
+                            if v > dst[i] { dst[i] = v }
+                        }
+                    } else {
+                        for i in 0..<rowLength {
+                            dst[i] += lut[Int(src[i])]
+                        }
                     }
                 } else {
-                    for i in 0..<rowLength {
-                        dst[i] += lut[Int(src[i])]
+                    let top = frame.base + (2 * y) * frame.bytesPerRow
+                    let bottom = top + frame.bytesPerRow
+                    for x in 0..<width {
+                        let s = 8 * x
+                        for c in 0..<4 {
+                            let v = (lut[Int(top[s + c])] + lut[Int(top[s + 4 + c])]
+                                     + lut[Int(bottom[s + c])] + lut[Int(bottom[s + 4 + c])]) * 0.25
+                            let i = 4 * x + c
+                            if brightest {
+                                if v > dst[i] { dst[i] = v }
+                            } else {
+                                dst[i] += v
+                            }
+                        }
                     }
                 }
             }
