@@ -61,7 +61,8 @@ enum Metadata {
         let fov = Double(device.activeFormat.videoFieldOfView)
         // 35 mm equivalent from the horizontal field of view of a 4:3 sensor (diagonal 43.27 mm).
         let computed35 = fov > 0 ? Int((17.31 / tan(fov * .pi / 360)).rounded()) : nil
-        var info = LensInfo(model: "\(deviceModel) back camera f/\(String(format: "%.2f", fNumber))",
+        let side = device.position == .front ? "front" : "back"
+        var info = LensInfo(model: "\(deviceModel) \(side) camera f/\(String(format: "%.2f", fNumber))",
                             focalLength: nil,
                             focalLength35mm: computed35,
                             fNumber: fNumber)

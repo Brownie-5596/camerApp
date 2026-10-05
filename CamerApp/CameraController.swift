@@ -62,7 +62,9 @@ final class CameraController: NSObject, ObservableObject {
     /// Technical summary of the current lens setup, for the camera report.
     private let sessionReport = Locked<String>("Camera not started")
     private var previewRotationObservation: NSKeyValueObservation?
-    private var peakingSettings = (on: false, redMode: false)
+    private var overlaySettings = (peaking: false, clipping: false, redMode: false)
+    private var statusTicks = 0
+    private var rawStackRunning = false
     private var inFlight: [Int64: PhotoCaptureProcessor] = [:]
     private var cameraControls: AnyObject?
 
@@ -121,6 +123,7 @@ final class CameraController: NSObject, ObservableObject {
         didSet {
             UserDefaults.standard.set(stackMode.rawValue, forKey: "stackMode")
             guard stackMode != oldValue else { return }
+            updateHistogramGain()
             if stackMode == .rawFrames && !format.isSingleRAW {
                 format = proRAWSupported ? .proRAW : .raw
                 show("RAW frames: each frame saved as \(outputMegapixels) MP \(format.rawValue)")
@@ -184,8 +187,32 @@ final class CameraController: NSObject, ObservableObject {
     @Published var lightningArmed = false
     @Published var lightningCount = 0
     @Published var lastMessage: String?
-    @Published var histogram: [Float] = []
-    @Published var peakingImage: CGImage?
+    @Published var histogram = HistogramReading()
+    /// Focus peaking / clipping warning drawn over the preview.
+    @Published var overlayImage: CGImage?
+    /// Thumbnail of the last saved photo.
+    @Published var lastThumbnail: CGImage?
+    /// Battery and free space, shown when nothing else is happening.
+    @Published var deviceStatus = ""
+    @Published var aeafLocked = false
+    /// Progress of an in-app RAW stack, e.g. "Stacking RAW 3/20…".
+    @Published var rawStackStatus: String?
+
+    /// How RAW frames are combined in the app after shooting (or Off to just save them).
+    @Published var rawBlend: RawBlend = .average {
+        didSet {
+            UserDefaults.standard.set(rawBlend.rawValue, forKey: "rawBlend")
+            updateHistogramGain()
+        }
+    }
+    /// Line frames up again if the camera moves during a stack.
+    @Published var alignFrames = true {
+        didSet { UserDefaults.standard.set(alignFrames, forKey: "alignFrames") }
+    }
+    /// Save in-app RAW stacks as 16-bit TIFF (large, best for editing) instead of 10-bit HEIF.
+    @Published var stackAsTIFF = false {
+        didSet { UserDefaults.standard.set(stackAsTIFF, forKey: "stackAsTIFF") }
+    }
 
     override init() {
         super.init()
@@ -203,8 +230,17 @@ final class CameraController: NSObject, ObservableObject {
         if defaults.object(forKey: "saveLocation") != nil {
             saveLocation = defaults.bool(forKey: "saveLocation")
         }
+        rawBlend = RawBlend(rawValue: defaults.string(forKey: "rawBlend") ?? "") ?? .average
+        if defaults.object(forKey: "alignFrames") != nil { alignFrames = defaults.bool(forKey: "alignFrames") }
+        stackAsTIFF = defaults.bool(forKey: "stackAsTIFF")
         frameProcessor.onHistogram = { [weak self] in self?.histogram = $0 }
-        frameProcessor.onPeaking = { [weak self] in self?.peakingImage = $0 }
+        frameProcessor.onOverlay = { [weak self] in self?.overlayImage = $0 }
+        PhotoLibrary.onSaved = { [weak self] data in
+            DispatchQueue.global(qos: .utility).async {
+                let thumbnail = PhotoLibrary.thumbnail(from: data)
+                DispatchQueue.main.async { if let thumbnail { self?.lastThumbnail = thumbnail } }
+            }
+        }
         // Settings saved by an older version might not fit together; tidy them up.
         if format == .raw || format == .rawPlusHEIF { preferredMegapixels = min(preferredMegapixels, 12) }
         if stackMode == .rawFrames && !format.isSingleRAW { format = .proRAW }
@@ -230,8 +266,18 @@ final class CameraController: NSObject, ObservableObject {
 
     /// Adding N frames brightens the result by log2(N) stops.
     private var stackGainEV: Float {
-        guard isLongExposure, stackMode == .longExposure, let frames = plannedFrames else { return 0 }
+        guard isLongExposure, addsLight, let frames = plannedFrames else { return 0 }
         return Float(log2(Double(frames)))
+    }
+
+    /// Long exposure mode (or RAW frames blended as a long exposure): frames are added together.
+    private var addsLight: Bool {
+        stackMode == .longExposure || (stackMode == .rawFrames && rawBlend == .longExposure)
+    }
+
+    /// Keeps the histogram showing the finished photo rather than one preview frame.
+    private func updateHistogramGain() {
+        frameProcessor.setHistogramGain(Float(pow(2, Double(stackGainEV))))
     }
 
     /// EXIF exposure program: 1 manual, 2 program, 4 shutter priority.
@@ -272,8 +318,11 @@ final class CameraController: NSObject, ObservableObject {
         sessionQueue.async {
             let order: [AVCaptureDevice.DeviceType] = [.builtInUltraWideCamera, .builtInWideAngleCamera, .builtInTelephotoCamera]
             let discovery = AVCaptureDevice.DiscoverySession(deviceTypes: order, mediaType: .video, position: .back)
-            let devices = discovery.devices.sorted {
+            var devices = discovery.devices.sorted {
                 (order.firstIndex(of: $0.deviceType) ?? 0) < (order.firstIndex(of: $1.deviceType) ?? 0)
+            }
+            if let front = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front) {
+                devices.append(front)
             }
             for d in devices { self.devicesByID[d.uniqueID] = d }
             let options = Self.lensOptions(for: devices)
@@ -297,7 +346,9 @@ final class CameraController: NSObject, ObservableObject {
 
             DispatchQueue.main.async { self.lenses = options }
 
-            if let initial = devices.first(where: { $0.deviceType == .builtInWideAngleCamera }) ?? devices.first {
+            let lastLens = UserDefaults.standard.string(forKey: "lastLens")
+            let mainCamera = devices.first { $0.deviceType == .builtInWideAngleCamera && $0.position == .back }
+            if let initial = devices.first(where: { $0.uniqueID == lastLens }) ?? mainCamera ?? devices.first {
                 if let failure = Diagnostics.guarded("lens setup", { self.switchTo(initial) }) {
                     DispatchQueue.main.async { self.show(failure) }
                 }
@@ -328,7 +379,7 @@ final class CameraController: NSObject, ObservableObject {
 
     /// Names lenses by zoom relative to the main camera, e.g. 0.5×, 1×, 5×.
     private static func lensOptions(for devices: [AVCaptureDevice]) -> [LensOption] {
-        let wide = devices.first { $0.deviceType == .builtInWideAngleCamera }
+        let wide = devices.first { $0.deviceType == .builtInWideAngleCamera && $0.position == .back }
         let wideTan = wide.map { tan(Double($0.activeFormat.videoFieldOfView) * .pi / 360) }
         return devices.map { device in
             var name: String
@@ -337,6 +388,9 @@ final class CameraController: NSObject, ObservableObject {
             case .builtInWideAngleCamera: name = "1×"
             case .builtInTelephotoCamera: name = "Tele"
             default: name = device.localizedName
+            }
+            if device.position == .front {
+                return LensOption(id: device.uniqueID, name: "Front")
             }
             let fov = Double(device.activeFormat.videoFieldOfView)
             if let wideTan, fov > 0, device.deviceType != .builtInWideAngleCamera {
@@ -435,6 +489,7 @@ final class CameraController: NSObject, ObservableObject {
             self.uiDevice = newDevice
             self.lensInfo = Metadata.lensInfo(for: newDevice)
             self.currentLensID = newDevice.uniqueID
+            UserDefaults.standard.set(newDevice.uniqueID, forKey: "lastLens")
             self.magnifierOn = false
             self.isoRange = isoRange
             self.isoStops = isoStops
@@ -472,10 +527,33 @@ final class CameraController: NSObject, ObservableObject {
 
     // MARK: - Manual controls (call on main)
 
-    func setAutoISO(_ on: Bool) { autoISO = on; applyExposure() }
+    func setAutoISO(_ on: Bool) { autoISO = on; if on { aeafLocked = false }; applyExposure() }
+
+    /// AE/AF lock: freeze exposure and focus where they are now (or let them go back to auto).
+    func toggleAEAFLock() {
+        if aeafLocked {
+            autoISO = true
+            autoShutter = true
+            bulb = false
+            autoFocus = true
+            aeafLocked = false
+            show("AE/AF unlocked")
+        } else {
+            autoISO = false
+            autoShutter = false
+            bulb = false
+            exposureSeconds = min(max(exposureSeconds, minDeviceExposure), maxDeviceExposure)
+            autoFocus = false
+            aeafLocked = true
+            show("AE/AF locked")
+        }
+        applyExposure()
+        applyFocus()
+    }
 
     func setAutoShutter(_ on: Bool) {
         autoShutter = on
+        if on { aeafLocked = false }
         if on {
             bulb = false
             exposureSeconds = min(max(exposureSeconds, minDeviceExposure), maxDeviceExposure)
@@ -516,7 +594,7 @@ final class CameraController: NSObject, ObservableObject {
         applyExposure()
     }
 
-    func setAutoFocus(_ on: Bool) { autoFocus = on; applyFocus() }
+    func setAutoFocus(_ on: Bool) { autoFocus = on; if on { aeafLocked = false }; applyFocus() }
     func setLensPosition(_ value: Float) { lensPosition = min(max(value, 0), 1); autoFocus = false; applyFocus() }
 
     func setAutoWhiteBalance(_ on: Bool) { autoWhiteBalance = on; applyWhiteBalance() }
@@ -633,6 +711,7 @@ final class CameraController: NSObject, ObservableObject {
 
     private func applyExposure() {
         lastExposureChange = CACurrentMediaTime()
+        updateHistogramGain()
         let full = fullAuto
         let bias = evBias
         let iso = self.iso
@@ -752,6 +831,8 @@ final class CameraController: NSObject, ObservableObject {
         if lightningArmed {
             lightningShotInfo.set(shotInfo(frameExposure: autoShutter ? exposureSeconds : subExposure))
         }
+        statusTicks += 1
+        if statusTicks % 40 == 1 { updateDeviceStatus() }
     }
 
     // MARK: - Shutter
@@ -856,7 +937,8 @@ final class CameraController: NSObject, ObservableObject {
         stackFrameTarget = frames
         stackSubExposure = sub
 
-        frameProcessor.startStack(mode: mode, frames: frames, metadata: { count, width, height in
+        let alignFieldOfView = alignFrames ? uiDevice.map { Double($0.activeFormat.videoFieldOfView) } : nil
+        frameProcessor.startStack(mode: mode, frames: frames, alignFieldOfView: alignFieldOfView, metadata: { count, width, height in
             let fix = location.snapshot(enabled: saveLocation)
             return Metadata.stackedImageProperties(shot: shot, kind: .stack(mode), frames: count,
                                                    width: width, height: height, orientation: orientation,
@@ -868,14 +950,15 @@ final class CameraController: NSObject, ObservableObject {
             self.isStacking = false
             self.stackFrameTarget = nil
             completion(count > 0)
-        }, completion: { [weak self] data, count in
+        }, completion: { [weak self] data, count, aligned in
             guard let self else { return }
             guard let data, count > 0 else {
                 self.show("Long exposure failed")
                 return
             }
             let total = Stops.shutterLabel(Double(count) * sub)
-            let description = mode == .longExposure ? "\(total) long exposure" : "\(total) \(mode.rawValue.lowercased()) stack"
+            var description = mode == .longExposure ? "\(total) long exposure" : "\(total) \(mode.rawValue.lowercased()) stack"
+            if aligned > 0 { description += " (\(aligned) frames re-aligned)" }
             let fix = location.snapshot(enabled: saveLocation)
             PhotoLibrary.save(primary: data, location: fix.location, successMessage: "Saved \(description)") { _, message in
                 self.show(message)
@@ -898,6 +981,16 @@ final class CameraController: NSObject, ObservableObject {
         let frames = plannedFrames
         // Follow the chosen format if it's a RAW one; otherwise use the best RAW available.
         let rawFormat = rawFramesFormat
+        // Optionally blend the frames into one picture in the app as well.
+        var session: RawStackSession?
+        if let mode = rawBlend.stackMode {
+            if rawStackRunning {
+                show("Still stacking the last RAW set: frames will be saved without blending")
+            } else {
+                session = RawStackSession(mode: mode, align: alignFrames,
+                                          fieldOfView: Double(uiDevice?.activeFormat.videoFieldOfView ?? 70))
+            }
+        }
         isStacking = true
         stackFrames = 0
         stackFrameTarget = frames
@@ -906,22 +999,101 @@ final class CameraController: NSObject, ObservableObject {
             var taken = 0
             while !Task.isCancelled, frames == nil || taken < frames! {
                 await self.waitForProcessingRoom()
+                let index = taken
+                var keepRAW: ((Data) -> Void)?
+                if let session {
+                    keepRAW = { data in session.store(data, index: index) }
+                }
                 let ok = await withCheckedContinuation { continuation in
-                    self.capturePhoto(formatOverride: rawFormat) { continuation.resume(returning: $0) }
+                    self.capturePhoto(formatOverride: rawFormat, onRAWData: keepRAW) { continuation.resume(returning: $0) }
                 }
                 if !ok { break }
+                session?.setAttitude(Motion.shared.attitude, index: index)
                 taken += 1
                 self.stackFrames = taken
             }
             self.isStacking = false
             self.stackFrameTarget = nil
             self.rawFramesTask = nil
-            self.show("Saved \(taken) RAW frames for stacking")
+            self.show("Saved \(taken) RAW frames")
             completion(taken > 0)
+            if let session, taken > 0 {
+                self.runRawStack(session, expected: taken)
+            }
         }
     }
 
-    private func capturePhoto(formatOverride: OutputFormat? = nil, completion: @escaping (Bool) -> Void) {
+    /// Blends the collected RAW frames in the background and saves the result.
+    private func runRawStack(_ session: RawStackSession, expected: Int) {
+        rawStackRunning = true
+        let fix = location.snapshot(enabled: saveLocation)
+        session.run(expected: expected, tiff: stackAsTIFF, progress: { [weak self] text in
+            self?.rawStackStatus = text
+        }, completion: { [weak self] data, summary in
+            guard let self else { return }
+            self.rawStackRunning = false
+            self.rawStackStatus = nil
+            guard let data else {
+                self.show("RAW stack failed: \(summary)")
+                return
+            }
+            PhotoLibrary.save(primary: data, primaryType: self.stackAsTIFF ? "public.tiff" : nil,
+                              location: fix.location, successMessage: "Saved: \(summary)") { _, message in
+                self.show(message)
+            }
+        })
+    }
+
+    /// Stacks photos picked from the library. `load` fetches photo number i.
+    func stackPhotos(count: Int, mode: StackMode, load: @escaping (Int) async -> Data?) {
+        guard !rawStackRunning else {
+            show("A stack is already being made")
+            return
+        }
+        rawStackRunning = true
+        rawStackStatus = "Loading photos…"
+        let align = alignFrames
+        let tiff = stackAsTIFF
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let stacker = RawStacker(mode: mode, align: align, fieldOfView: nil)
+            for i in 0..<count {
+                await MainActor.run { self?.rawStackStatus = "Stacking photo \(i + 1)/\(count)…" }
+                guard let data = await load(i) else { continue }
+                autoreleasepool { stacker.add(imageData: data, rotationSinceFirst: nil) }
+            }
+            await MainActor.run { self?.rawStackStatus = "Saving stacked image…" }
+            let result = stacker.finish(tiff: tiff)
+            await MainActor.run {
+                guard let self else { return }
+                self.rawStackRunning = false
+                self.rawStackStatus = nil
+                guard let data = result.data else {
+                    self.show("Stack failed: \(result.summary)")
+                    return
+                }
+                PhotoLibrary.save(primary: data, primaryType: tiff ? "public.tiff" : nil,
+                                  successMessage: "Saved: \(result.summary)") { _, message in
+                    self.show(message)
+                }
+            }
+        }
+    }
+
+    private func updateDeviceStatus() {
+        UIDevice.current.isBatteryMonitoringEnabled = true
+        var parts: [String] = []
+        let battery = UIDevice.current.batteryLevel
+        if battery >= 0 { parts.append("Battery \(Int((battery * 100).rounded()))%") }
+        let home = URL(fileURLWithPath: NSHomeDirectory())
+        if let values = try? home.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
+           let free = values.volumeAvailableCapacityForImportantUsage {
+            parts.append(String(format: "%.0f GB free", Double(free) / 1_000_000_000))
+        }
+        deviceStatus = parts.joined(separator: " · ")
+    }
+
+    private func capturePhoto(formatOverride: OutputFormat? = nil, onRAWData: ((Data) -> Void)? = nil,
+                              completion: @escaping (Bool) -> Void) {
         let format = formatOverride ?? self.format
         let megapixels = self.megapixels(for: format)
         let highResolution = megapixels > 13
@@ -972,7 +1144,7 @@ final class CameraController: NSObject, ObservableObject {
                 self.isCapturing = false
                 completion(success)
             }
-            let processor = PhotoCaptureProcessor(gps: gps, location: fix.location, deviceID: deviceID, onExposureDone: {
+            let processor = PhotoCaptureProcessor(gps: gps, location: fix.location, deviceID: deviceID, onRAWData: onRAWData, onExposureDone: {
                 DispatchQueue.main.async {
                     counted = true
                     self.processingCount += 1
@@ -1004,17 +1176,18 @@ final class CameraController: NSObject, ObservableObject {
 
     // MARK: - Live view helpers
 
-    func setPeaking(_ on: Bool, redMode: Bool) {
-        peakingSettings = (on, redMode)
+    func setOverlays(peaking: Bool, clipping: Bool, redMode: Bool) {
+        overlaySettings = (peaking, clipping, redMode)
         let angle = rotationCoordinator?.videoRotationAngleForHorizonLevelPreview ?? 90
-        frameProcessor.setPeaking(enabled: on, orientation: Stops.orientation(forRotationAngle: angle), redMode: redMode)
+        frameProcessor.setOverlays(peaking: peaking, clipping: clipping,
+                                   orientation: Stops.orientation(forRotationAngle: angle), redMode: redMode)
     }
 
     private func applyPreviewRotation(_ angle: CGFloat) {
         if let connection = previewLayer.connection, connection.isVideoRotationAngleSupported(angle) {
             connection.videoRotationAngle = angle
         }
-        setPeaking(peakingSettings.on, redMode: peakingSettings.redMode)
+        setOverlays(peaking: overlaySettings.peaking, clipping: overlaySettings.clipping, redMode: overlaySettings.redMode)
     }
 
     /// The size photos will actually be, given the preference and what this lens can do.
@@ -1043,7 +1216,8 @@ final class CameraController: NSObject, ObservableObject {
     /// What a long exposure will produce, e.g. "12MP HEIF" or "48MP ProRAW frames".
     var longExposureOutput: String {
         if stackMode == .rawFrames {
-            return "\(megapixels(for: rawFramesFormat))MP \(rawFramesFormat.rawValue) frames"
+            let frames = "\(megapixels(for: rawFramesFormat))MP \(rawFramesFormat.rawValue)"
+            return rawBlend == .off ? "\(frames) frames" : "\(frames) + \(rawBlend.shortName.replacingOccurrences(of: "RAW+", with: "")) stack"
         }
         return "\(stackMegapixels)MP HEIF"
     }

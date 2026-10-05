@@ -16,6 +16,10 @@ struct ContentView: View {
     @AppStorage("showLevel") private var showLevel = true
     @AppStorage("showHistogram") private var showHistogram = true
     @AppStorage("peaking") private var peaking = false
+    @AppStorage("clippingWarning") private var clippingWarning = false
+    @AppStorage("dimScreen") private var dimScreen = false
+    @State private var showHistogramGuide = false
+    @State private var brightnessBeforeDimming: CGFloat?
     @State private var selectedSetting: CameraSetting = .shutter
     @State private var showIntervalometer = false
     @State private var showSettings = false
@@ -58,10 +62,12 @@ struct ContentView: View {
             updateInterfaceRotation()
             camera.start()
             level.start()
-            camera.setPeaking(peaking, redMode: redMode)
+            updateOverlays()
         }
-        .onChange(of: peaking) { _, on in camera.setPeaking(on, redMode: redMode) }
-        .onChange(of: redMode) { _, red in camera.setPeaking(peaking, redMode: red) }
+        .onChange(of: peaking) { _, _ in updateOverlays() }
+        .onChange(of: clippingWarning) { _, _ in updateOverlays() }
+        .onChange(of: redMode) { _, _ in updateOverlays() }
+        .onChange(of: intervalometer.isRunning) { _, running in dimForIntervalometer(running) }
         .onChange(of: keepAwake) { _, awake in UIApplication.shared.isIdleTimerDisabled = awake }
         .sheet(isPresented: $showIntervalometer) {
             IntervalometerView(intervalometer: intervalometer, camera: camera, theme: theme)
@@ -75,13 +81,18 @@ struct ContentView: View {
         } message: {
             Text((lastCrash ?? "") + "\n\nTap Copy details and paste it to Claude.")
         }
+        .sheet(isPresented: $showHistogramGuide) {
+            HistogramGuide(theme: theme)
+                .presentationBackground(.black)
+        }
         .sheet(isPresented: $showPresets) {
             PresetsSheet(camera: camera, theme: theme)
                 .presentationBackground(.black)
         }
         .sheet(isPresented: $showSettings) {
             SettingsSheet(camera: camera, theme: theme, showGrid: $showGrid, showLevel: $showLevel,
-                          showHistogram: $showHistogram, peaking: $peaking)
+                          showHistogram: $showHistogram, peaking: $peaking, clippingWarning: $clippingWarning,
+                          dimScreen: $dimScreen)
                 .presentationBackground(.black)
         }
     }
@@ -100,12 +111,14 @@ struct ContentView: View {
                 Spacer()
                 Color.clear.frame(width: 56, height: 32)
             }
-            HStack {
+            HStack(spacing: 4) {
+                thumbnailButton
                 intervalometerButton
                 Spacer()
                 shutterButton
                 Spacer()
                 selfTimerButton
+                lockButton
             }
         }
         .padding(.horizontal, 12)
@@ -119,8 +132,6 @@ struct ContentView: View {
                 modesButton
                 ForEach(camera.lenses) { lensButton($0) }
                 Spacer(minLength: 0)
-                intervalometerButton
-                selfTimerButton
             }
             .frame(width: 60)
 
@@ -136,6 +147,12 @@ struct ContentView: View {
                 Spacer(minLength: 0)
                 shutterButton
                 Spacer(minLength: 0)
+                HStack(spacing: 4) {
+                    thumbnailButton
+                    intervalometerButton
+                    selfTimerButton
+                    lockButton
+                }
             }
             .frame(width: 250)
         }
@@ -149,6 +166,22 @@ struct ContentView: View {
         case .landscapeRight: interfaceRotation = -90
         case .portraitUpsideDown: interfaceRotation = 180
         default: interfaceRotation = 0
+        }
+    }
+
+    private func updateOverlays() {
+        camera.setOverlays(peaking: peaking, clipping: clippingWarning, redMode: redMode)
+    }
+
+    /// Long intervalometer sessions: dim the screen to save battery (and your night vision).
+    private func dimForIntervalometer(_ running: Bool) {
+        guard let screen = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first?.screen else { return }
+        if running && dimScreen {
+            brightnessBeforeDimming = screen.brightness
+            screen.brightness = 0.05
+        } else if let previous = brightnessBeforeDimming {
+            screen.brightness = previous
+            brightnessBeforeDimming = nil
         }
     }
 
@@ -177,6 +210,7 @@ struct ContentView: View {
 
     /// Shutter button, volume buttons and Camera Control.
     private func shutter() {
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
         if intervalometer.isRunning {
             intervalometer.stop()
             if camera.isStacking { camera.finishStack() }
@@ -213,7 +247,7 @@ struct ContentView: View {
                 }
                 .opacity(blendedLongExposure ? 0.4 : 1)
             }
-            chip(camera.stackMode.shortName) {
+            chip(camera.stackMode == .rawFrames ? camera.rawBlend.shortName : camera.stackMode.shortName) {
                 let modes = StackMode.allCases
                 if let i = modes.firstIndex(of: camera.stackMode) {
                     camera.stackMode = modes[(i + 1) % modes.count]
@@ -266,12 +300,13 @@ struct ContentView: View {
 
     /// One line under the top bar for everything the camera is telling you.
     private var statusLine: some View {
-        let parts = [statusText, camera.lastMessage].compactMap { $0 }
-        return Text(parts.isEmpty ? " " : parts.joined(separator: "  ·  "))
+        let parts = [statusText, camera.rawStackStatus, camera.lastMessage].compactMap { $0 }
+        let idle = parts.isEmpty
+        return Text(idle ? (camera.deviceStatus.isEmpty ? " " : camera.deviceStatus) : parts.joined(separator: "  ·  "))
             .font(.caption.monospacedDigit())
             .lineLimit(1)
             .truncationMode(.middle)
-            .foregroundStyle(camera.lastMessage != nil ? theme.accent : theme.primary)
+            .foregroundStyle(idle ? theme.secondary : (camera.lastMessage != nil ? theme.accent : theme.primary))
             .frame(maxWidth: .infinity)
             .frame(height: 16)
     }
@@ -288,6 +323,10 @@ struct ContentView: View {
                         if tapPoint == location { tapPoint = nil }
                     }
                 }
+                .onLongPressGesture(minimumDuration: 0.6) {
+                    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                    camera.toggleAEAFLock()
+                }
                 .gesture(
                     MagnifyGesture()
                         .onChanged { value in
@@ -299,7 +338,7 @@ struct ContentView: View {
                 )
 
             Group {
-                if peaking, let image = camera.peakingImage {
+                if peaking || clippingWarning, let image = camera.overlayImage {
                     Image(decorative: image, scale: 1)
                         .resizable()
                 }
@@ -320,10 +359,17 @@ struct ContentView: View {
         }
         .aspectRatio(aspectRatio, contentMode: .fit)
         .overlay(alignment: .topLeading) {
-            if showHistogram && !camera.histogram.isEmpty {
-                HistogramView(bins: camera.histogram, color: theme.primary)
-                    .padding(8)
-                    .allowsHitTesting(false)
+            if showHistogram && !camera.histogram.bins.isEmpty {
+                Button {
+                    showHistogramGuide = true
+                } label: {
+                    VStack(alignment: .leading, spacing: 3) {
+                        HistogramView(bins: camera.histogram.bins, color: theme.primary)
+                        ExposureCheck(verdict: camera.histogram.verdict, theme: theme)
+                    }
+                }
+                .buttonStyle(.plain)
+                .padding(8)
             }
         }
         .overlay(alignment: .topTrailing) {
@@ -388,10 +434,16 @@ struct ContentView: View {
         Button {
             camera.selectLens(lens.id)
         } label: {
-            Text(lens.name)
-                .font(.footnote.bold())
-                .frame(width: 44, height: 44)
-                .background(Circle().fill(Color.white.opacity(0.12)))
+            Group {
+                if lens.name == "Front" {
+                    Image(systemName: "person.crop.circle")
+                } else {
+                    Text(lens.name)
+                }
+            }
+            .font(.footnote.bold())
+            .frame(width: 44, height: 44)
+            .background(Circle().fill(Color.white.opacity(0.12)))
         }
         .foregroundStyle(lens.id == camera.currentLensID ? theme.accent : theme.primary)
     }
@@ -402,7 +454,7 @@ struct ContentView: View {
         } label: {
             Image(systemName: "timelapse")
                 .font(.title2)
-                .frame(width: 56, height: 56)
+                .frame(width: 48, height: 48)
         }
         .foregroundStyle(intervalometer.isRunning ? theme.accent : theme.primary)
     }
@@ -420,9 +472,47 @@ struct ContentView: View {
                     Text("\(camera.selfTimerSeconds)s").font(.caption2.bold())
                 }
             }
-            .frame(width: 56, height: 56)
+            .frame(width: 48, height: 48)
         }
         .foregroundStyle(camera.selfTimerSeconds > 0 ? theme.accent : theme.primary)
+    }
+
+    /// Last photo; tap to open the Photos app.
+    private var thumbnailButton: some View {
+        Button {
+            if let url = URL(string: "photos-redirect://") { UIApplication.shared.open(url) }
+        } label: {
+            Group {
+                if let thumbnail = camera.lastThumbnail {
+                    Image(decorative: thumbnail, scale: 1)
+                        .resizable()
+                        .scaledToFill()
+                } else {
+                    Image(systemName: "photo.on.rectangle")
+                        .font(.title3)
+                }
+            }
+            .frame(width: 40, height: 40)
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+            .overlay(RoundedRectangle(cornerRadius: 6).stroke(theme.primary.opacity(0.5), lineWidth: 1))
+            .frame(width: 48, height: 48)
+        }
+        .foregroundStyle(theme.primary)
+    }
+
+    /// AE/AF lock (also: long-press the preview).
+    private var lockButton: some View {
+        Button {
+            camera.toggleAEAFLock()
+        } label: {
+            VStack(spacing: 0) {
+                Image(systemName: camera.aeafLocked ? "lock.fill" : "lock.open")
+                    .font(.title3)
+                Text("AE/AF").font(.system(size: 8, weight: .bold))
+            }
+            .frame(width: 48, height: 48)
+        }
+        .foregroundStyle(camera.aeafLocked ? theme.accent : theme.primary)
     }
 
     private var stackProgress: Double {

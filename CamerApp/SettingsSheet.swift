@@ -1,3 +1,4 @@
+import PhotosUI
 import SwiftUI
 
 struct SettingsSheet: View {
@@ -7,7 +8,11 @@ struct SettingsSheet: View {
     @Binding var showLevel: Bool
     @Binding var showHistogram: Bool
     @Binding var peaking: Bool
+    @Binding var clippingWarning: Bool
+    @Binding var dimScreen: Bool
     @Environment(\.dismiss) private var dismiss
+    @State private var pickedPhotos: [PhotosPickerItem] = []
+    @State private var choosingBlend = false
 
     var body: some View {
         NavigationStack {
@@ -59,10 +64,30 @@ struct SettingsSheet: View {
                     .pickerStyle(.segmented)
                     Text(camera.stackMode.explanation)
                         .font(.footnote)
+                    if camera.stackMode == .rawFrames {
+                        Picker("Also blend in the app", selection: $camera.rawBlend) {
+                            ForEach(RawBlend.allCases) { blend in
+                                Text(blend.rawValue).tag(blend)
+                            }
+                        }
+                        Text("After the frames are shot, the app combines them into one full-resolution picture (e.g. 48 MP ProRAW), as well as keeping every frame. It takes a few seconds per frame and runs in the background.")
+                            .font(.footnote)
+                    }
+                    Toggle("Fix camera movement", isOn: $camera.alignFrames)
+                    Toggle("Save RAW stacks as 16-bit TIFF", isOn: $camera.stackAsTIFF)
                 } header: {
                     Text("Long exposures")
                 } footer: {
-                    Text("This lens can expose for up to \(Stops.shutterLabel(camera.maxDeviceExposure)) in one go. Choose a slower shutter speed (or BULB) and the app stacks frames to build the exposure. Stacked shots save as HEIF. Use a tripod.")
+                    Text("This lens can expose for up to \(Stops.shutterLabel(camera.maxDeviceExposure)) in one go. Choose a slower shutter speed (or BULB) and the app stacks frames to build the exposure. Fix camera movement uses the gyroscope to notice a bump, then lines the frames back up. TIFF keeps the most editing room but files are very large (about 380 MB at 48 MP); otherwise RAW stacks are 10-bit HEIF.")
+                }
+
+                Section {
+                    PhotosPicker(selection: $pickedPhotos, maxSelectionCount: 300, matching: .images,
+                                 preferredItemEncoding: .current) {
+                        Label("Stack photos from your library…", systemImage: "square.stack.3d.up")
+                    }
+                } footer: {
+                    Text("Pick a series of shots taken on a tripod (ProRAW frames work best) and blend them into one. Frames are lined up automatically if the camera moved.")
                 }
 
                 Section("Self-timer") {
@@ -98,11 +123,17 @@ struct SettingsSheet: View {
                     Text("Copies technical details about your camera and the app's settings. Paste it to Claude to help diagnose problems.")
                 }
 
-                Section("Display") {
+                Section {
                     Toggle("Grid", isOn: $showGrid)
                     Toggle("Level", isOn: $showLevel)
                     Toggle("Histogram", isOn: $showHistogram)
                     Toggle("Focus peaking", isOn: $peaking)
+                    Toggle("Clipping warning", isOn: $clippingWarning)
+                    Toggle("Dim screen during intervalometer", isOn: $dimScreen)
+                } header: {
+                    Text("Display")
+                } footer: {
+                    Text("Clipping warning shows blown-out (pure white) areas in pink. Tap the histogram for a guide on reading it.")
                 }
 
                 Section("Buttons") {
@@ -115,7 +146,9 @@ struct SettingsSheet: View {
                         .font(.footnote)
                     Text("Pinch the preview to zoom; tap the zoom badge to go back to 1×. The ◎ button turns on focus peaking (sharp edges glow green).")
                         .font(.footnote)
-                    Text("Tap the preview to focus there. With manual focus, a tap focuses once and locks.")
+                    Text("Tap the preview to focus there. With manual focus, a tap focuses once and locks. Long-press the preview (or the AE/AF button) to lock exposure and focus.")
+                        .font(.footnote)
+                    Text("Tap the thumbnail to open the Photos app.")
                         .font(.footnote)
                 }
             }
@@ -129,6 +162,24 @@ struct SettingsSheet: View {
                     Button("Done") { dismiss() }
                 }
             }
+            .onChange(of: pickedPhotos) { _, items in
+                if !items.isEmpty { choosingBlend = true }
+            }
+            .confirmationDialog("Blend \(pickedPhotos.count) photos", isPresented: $choosingBlend, titleVisibility: .visible) {
+                Button("Average (cleanest, aurora & Milky Way)") { stack(.average) }
+                Button("Long exposure (adds the light)") { stack(.longExposure) }
+                Button("Brightest (star trails, lightning)") { stack(.brightest) }
+                Button("Cancel", role: .cancel) { pickedPhotos = [] }
+            }
         }
+    }
+
+    private func stack(_ mode: StackMode) {
+        let items = pickedPhotos
+        pickedPhotos = []
+        camera.stackPhotos(count: items.count, mode: mode) { index in
+            try? await items[index].loadTransferable(type: Data.self)
+        }
+        dismiss()
     }
 }

@@ -77,7 +77,9 @@ final class Stacker {
     private var sourceWidth = 0
     private var sourceHeight = 0
 
-    func add(_ frame: FrameView) {
+    /// Adds a frame. `shift` says where the picture moved to in this frame (see `Alignment.shift`),
+    /// so it can be put back in line with the first frame.
+    func add(_ frame: FrameView, shift: (dx: Int, dy: Int) = (0, 0)) {
         if accumulator == nil {
             sourceWidth = frame.width
             sourceHeight = frame.height
@@ -93,29 +95,45 @@ final class Stacker {
 
         let rowLength = width * 4
         let brightest = mode == .brightest
+        let lastX = frame.width - step
+        let lastY = frame.height - step
         Self.toLinear.withUnsafeBufferPointer { lut in
             for y in 0..<height {
                 let dst = acc + y * rowLength
-                if step == 1 {
-                    let src = frame.base + y * frame.bytesPerRow
+                // Source row, moved by the shift and kept inside the frame (edges repeat).
+                let sy = min(max(step * y + shift.dy, 0), lastY)
+                let top = frame.base + sy * frame.bytesPerRow
+                if step == 1 && shift.dx == 0 {
                     if brightest {
                         for i in 0..<rowLength {
-                            let v = lut[Int(src[i])]
+                            let v = lut[Int(top[i])]
                             if v > dst[i] { dst[i] = v }
                         }
                     } else {
                         for i in 0..<rowLength {
-                            dst[i] += lut[Int(src[i])]
+                            dst[i] += lut[Int(top[i])]
+                        }
+                    }
+                } else if step == 1 {
+                    for x in 0..<width {
+                        let s = top + 4 * min(max(x + shift.dx, 0), lastX)
+                        let d = dst + 4 * x
+                        for c in 0..<4 {
+                            let v = lut[Int(s[c])]
+                            if brightest {
+                                if v > d[c] { d[c] = v }
+                            } else {
+                                d[c] += v
+                            }
                         }
                     }
                 } else {
-                    let top = frame.base + (2 * y) * frame.bytesPerRow
                     let bottom = top + frame.bytesPerRow
                     for x in 0..<width {
-                        let s = 8 * x
+                        let sx = 4 * min(max(2 * x + shift.dx, 0), lastX)
                         for c in 0..<4 {
-                            let v = (lut[Int(top[s + c])] + lut[Int(top[s + 4 + c])]
-                                     + lut[Int(bottom[s + c])] + lut[Int(bottom[s + 4 + c])]) * 0.25
+                            let v = (lut[Int(top[sx + c])] + lut[Int(top[sx + 4 + c])]
+                                     + lut[Int(bottom[sx + c])] + lut[Int(bottom[sx + 4 + c])]) * 0.25
                             let i = 4 * x + c
                             if brightest {
                                 if v > dst[i] { dst[i] = v }

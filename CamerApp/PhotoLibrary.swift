@@ -1,5 +1,6 @@
 import AVFoundation
 import CoreLocation
+import ImageIO
 import Photos
 
 /// Handles one photo capture. Reports when the exposure ends (so the next shot can start
@@ -8,6 +9,7 @@ final class PhotoCaptureProcessor: NSObject, AVCapturePhotoCaptureDelegate {
     private let customizer: MetadataCustomizer
     private let location: CLLocation?
     private let deviceID: String?
+    private let onRAWData: ((Data) -> Void)?
     private let onExposureDone: () -> Void
     private let onCaptured: (Bool) -> Void
     private let onSaved: (Bool, String) -> Void
@@ -23,6 +25,7 @@ final class PhotoCaptureProcessor: NSObject, AVCapturePhotoCaptureDelegate {
     private var expectedProcessing: Double?
 
     init(gps: [String: Any]?, location: CLLocation?, deviceID: String?,
+         onRAWData: ((Data) -> Void)? = nil,
          onExposureDone: @escaping () -> Void,
          onCaptured: @escaping (Bool) -> Void,
          onSaved: @escaping (Bool, String) -> Void,
@@ -30,6 +33,7 @@ final class PhotoCaptureProcessor: NSObject, AVCapturePhotoCaptureDelegate {
         self.customizer = MetadataCustomizer(gps: gps)
         self.location = location
         self.deviceID = deviceID
+        self.onRAWData = onRAWData
         self.onExposureDone = onExposureDone
         self.onCaptured = onCaptured
         self.onSaved = onSaved
@@ -57,6 +61,7 @@ final class PhotoCaptureProcessor: NSObject, AVCapturePhotoCaptureDelegate {
         guard error == nil, let data = photo.fileDataRepresentation(with: customizer) else { return }
         if photo.isRawPhoto {
             raw = data
+            onRAWData?(data)
         } else {
             processed = data
             if let deviceID { Metadata.rememberLens(from: photo.metadata, deviceID: deviceID) }
@@ -103,6 +108,20 @@ final class PhotoCaptureProcessor: NSObject, AVCapturePhotoCaptureDelegate {
 }
 
 enum PhotoLibrary {
+    /// Called (on any thread) with the main file of every photo saved successfully.
+    static var onSaved: ((Data) -> Void)?
+
+    /// A small preview image, using the embedded preview where there is one (RAW files).
+    static func thumbnail(from data: Data) -> CGImage? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageIfAbsent: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: 200,
+        ]
+        return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
+    }
+
     /// Saves one photo, optionally with a RAW file attached (shown as RAW+HEIF in Photos).
     /// `completion` runs on the main thread.
     static func save(primary: Data,
@@ -132,6 +151,7 @@ enum PhotoLibrary {
                 }
             }) { success, error in
                 if success {
+                    onSaved?(primary)
                     finish(true, successMessage)
                 } else {
                     finish(false, "Save failed: \(error?.localizedDescription ?? "unknown error")")
