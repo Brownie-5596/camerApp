@@ -1,5 +1,4 @@
 import Foundation
-import UIKit
 
 @MainActor
 final class Intervalometer: ObservableObject {
@@ -24,13 +23,13 @@ final class Intervalometer: ObservableObject {
         guard !isRunning else { return }
         isRunning = true
         shotsTaken = 0
-        UIApplication.shared.isIdleTimerDisabled = true
 
         task = Task {
             await wait(delaySeconds)
             while !Task.isCancelled && (unlimited || shotsTaken < shotCount) {
                 let started = Date()
-                _ = await camera.captureAsync()
+                // Uses whatever the camera is set to, including stacked long exposures.
+                _ = await camera.takePictureAsync()
                 if Task.isCancelled { return }
                 shotsTaken += 1
                 if !unlimited && shotsTaken >= shotCount { break }
@@ -50,7 +49,6 @@ final class Intervalometer: ObservableObject {
         task = nil
         isRunning = false
         countdown = 0
-        UIApplication.shared.isIdleTimerDisabled = false
     }
 
     private func wait(_ seconds: Double) async {

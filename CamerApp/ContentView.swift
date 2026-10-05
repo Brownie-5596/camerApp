@@ -7,34 +7,25 @@ struct Theme {
     var secondary: Color { redMode ? Color(red: 0.4, green: 0, blue: 0) : .gray }
 }
 
-enum CameraSetting: String, CaseIterable, Identifiable {
-    case iso = "ISO"
-    case shutter = "SHUTTER"
-    case focus = "FOCUS"
-    case whiteBalance = "WB"
-    var id: String { rawValue }
-}
-
-enum Formatters {
-    static func shutter(_ seconds: Double) -> String {
-        guard seconds.isFinite, seconds > 0 else { return "--" }
-        if seconds >= 0.95 { return String(format: "%.1fs", seconds) }
-        return "1/\(Int((1 / seconds).rounded()))"
-    }
-
-    static func whole(_ value: Float) -> String {
-        value.isFinite ? "\(Int(value.rounded()))" : "--"
-    }
-}
-
 struct ContentView: View {
     @StateObject private var camera = CameraController()
     @StateObject private var intervalometer = Intervalometer()
+    @StateObject private var level = LevelMonitor()
     @AppStorage("redMode") private var redMode = false
+    @AppStorage("showGrid") private var showGrid = false
+    @AppStorage("showLevel") private var showLevel = true
+    @AppStorage("showHistogram") private var showHistogram = true
+    @AppStorage("peaking") private var peaking = false
     @State private var selectedSetting: CameraSetting = .shutter
     @State private var showIntervalometer = false
+    @State private var showSettings = false
+    @State private var tapPoint: CGPoint?
 
     private var theme: Theme { Theme(redMode: redMode) }
+
+    private var keepAwake: Bool {
+        intervalometer.isRunning || camera.isStacking || camera.lightningArmed || camera.timerRemaining != nil
+    }
 
     var body: some View {
         ZStack {
@@ -45,9 +36,10 @@ struct ContentView: View {
                     .foregroundStyle(theme.primary)
                     .padding()
             } else {
-                VStack(spacing: 12) {
+                VStack(spacing: 10) {
                     topBar
                     preview
+                    MeterRow(camera: camera, theme: theme)
                     SettingsPanel(camera: camera, selected: $selectedSetting, theme: theme)
                     lensPicker
                     bottomBar
@@ -57,52 +49,161 @@ struct ContentView: View {
             }
         }
         .tint(theme.accent)
-        .onAppear { camera.start() }
+        .onAppear {
+            camera.start()
+            level.start()
+            camera.setPeaking(peaking, redMode: redMode)
+        }
+        .onChange(of: peaking) { _, on in camera.setPeaking(on, redMode: redMode) }
+        .onChange(of: redMode) { _, red in camera.setPeaking(peaking, redMode: red) }
+        .onChange(of: keepAwake) { _, awake in UIApplication.shared.isIdleTimerDisabled = awake }
         .sheet(isPresented: $showIntervalometer) {
             IntervalometerView(intervalometer: intervalometer, camera: camera, theme: theme)
                 .presentationDetents([.medium])
                 .presentationBackground(.black)
         }
+        .sheet(isPresented: $showSettings) {
+            SettingsSheet(camera: camera, theme: theme, showGrid: $showGrid, showLevel: $showLevel,
+                          showHistogram: $showHistogram, peaking: $peaking)
+                .presentationBackground(.black)
+        }
     }
 
+    /// Shutter button, volume buttons and Camera Control.
+    private func shutter() {
+        if intervalometer.isRunning {
+            intervalometer.stop()
+            if camera.isStacking { camera.finishStack() }
+            return
+        }
+        camera.shutterPressed()
+    }
+
+    // MARK: - Top bar
+
     private var topBar: some View {
-        HStack {
-            Button {
-                camera.format = camera.format == .raw ? .heif : .raw
-            } label: {
-                Text(camera.format.rawValue)
-                    .font(.system(.footnote, design: .monospaced).bold())
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 5)
-                    .overlay(Capsule().stroke(theme.primary, lineWidth: 1))
+        HStack(spacing: 14) {
+            chip(camera.format.rawValue) {
+                let options = OutputFormat.allCases.filter { camera.rawSupported || !$0.needsRAW }
+                if let i = options.firstIndex(of: camera.format) {
+                    camera.format = options[(i + 1) % options.count]
+                }
             }
-            .disabled(!camera.rawSupported)
+            chip(camera.stackMode.shortName) {
+                let modes = StackMode.allCases
+                if let i = modes.firstIndex(of: camera.stackMode) {
+                    camera.stackMode = modes[(i + 1) % modes.count]
+                    camera.show("Stacking: \(camera.stackMode.rawValue)")
+                }
+            }
             Spacer()
-            Button {
-                redMode.toggle()
-            } label: {
-                Image(systemName: redMode ? "eye.fill" : "eye")
-                    .font(.title3)
-                    .frame(width: 44, height: 32)
+            iconButton(camera.lightningArmed ? "bolt.fill" : "bolt", active: camera.lightningArmed) {
+                camera.setLightning(!camera.lightningArmed)
             }
+            .disabled(camera.isStacking)
+            iconButton("scope", active: peaking) { peaking.toggle() }
+            iconButton("plus.magnifyingglass", active: camera.magnifierOn) {
+                camera.setMagnifier(!camera.magnifierOn)
+            }
+            iconButton(redMode ? "eye.fill" : "eye", active: redMode) { redMode.toggle() }
+            iconButton("gearshape", active: false) { showSettings = true }
         }
         .foregroundStyle(theme.primary)
     }
 
+    private func chip(_ title: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(.caption, design: .monospaced).bold())
+                .padding(.horizontal, 8)
+                .padding(.vertical, 5)
+                .overlay(Capsule().stroke(theme.primary, lineWidth: 1))
+        }
+    }
+
+    private func iconButton(_ symbol: String, active: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 17))
+                .frame(width: 28, height: 32)
+        }
+        .foregroundStyle(active ? theme.accent : theme.primary)
+    }
+
+    // MARK: - Preview
+
     private var preview: some View {
-        CameraPreview(camera: camera, redMode: redMode)
-            .aspectRatio(3.0 / 4.0, contentMode: .fit)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .overlay(alignment: .top) {
-                if intervalometer.isRunning {
-                    badge(intervalometer.statusText)
+        ZStack {
+            CameraPreview(camera: camera, redMode: redMode, onShutterEvent: shutter)
+                .onTapGesture { location in
+                    tapPoint = location
+                    camera.focus(atLayerPoint: location)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+                        if tapPoint == location { tapPoint = nil }
+                    }
+                }
+
+            Group {
+                if peaking, let image = camera.peakingImage {
+                    Image(decorative: image, scale: 1)
+                        .resizable()
+                }
+                if showGrid {
+                    GridOverlay(color: theme.primary.opacity(0.35))
+                }
+                if showLevel {
+                    LevelOverlay(level: level, theme: theme)
+                }
+                if let point = tapPoint {
+                    RoundedRectangle(cornerRadius: 4)
+                        .stroke(theme.accent, lineWidth: 1.5)
+                        .frame(width: 70, height: 70)
+                        .position(point)
                 }
             }
-            .overlay(alignment: .bottom) {
-                if let message = camera.lastMessage {
-                    badge(message)
-                }
+            .allowsHitTesting(false)
+        }
+        .aspectRatio(3.0 / 4.0, contentMode: .fit)
+        .overlay(alignment: .topLeading) {
+            if showHistogram && !camera.histogram.isEmpty {
+                HistogramView(bins: camera.histogram, color: theme.primary)
+                    .padding(8)
+                    .allowsHitTesting(false)
             }
+        }
+        .overlay(alignment: .top) {
+            if let status = statusText {
+                badge(status).padding(.top, showHistogram ? 58 : 0)
+            }
+        }
+        .overlay(alignment: .bottom) {
+            if let message = camera.lastMessage {
+                badge(message)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var statusText: String? {
+        if let remaining = camera.timerRemaining {
+            return "Self-timer \(remaining)"
+        }
+        if camera.isStacking {
+            let elapsed = Double(camera.stackFrames) * camera.stackSubExposure
+            if let target = camera.stackFrameTarget {
+                if camera.stackFrames >= target { return "Processing…" }
+                let total = Double(target) * camera.stackSubExposure
+                return String(format: "Exposing %.0f / %.0fs", elapsed, total)
+            }
+            return String(format: "BULB %.0fs · press shutter to end", elapsed)
+        }
+        if intervalometer.isRunning {
+            return intervalometer.statusText
+        }
+        if camera.lightningArmed {
+            return "Watching for lightning · \(camera.lightningCount) caught"
+        }
+        return nil
     }
 
     private func badge(_ text: String) -> some View {
@@ -113,7 +214,10 @@ struct ContentView: View {
             .background(Color.black.opacity(0.65), in: Capsule())
             .foregroundStyle(theme.primary)
             .padding(8)
+            .allowsHitTesting(false)
     }
+
+    // MARK: - Bottom
 
     private var lensPicker: some View {
         HStack(spacing: 12) {
@@ -136,7 +240,7 @@ struct ContentView: View {
             Button {
                 showIntervalometer = true
             } label: {
-                Image(systemName: "timer")
+                Image(systemName: "timelapse")
                     .font(.title2)
                     .frame(width: 56, height: 56)
             }
@@ -146,151 +250,57 @@ struct ContentView: View {
             shutterButton
             Spacer()
 
-            Color.clear.frame(width: 56, height: 56)
+            Button {
+                let options = [0, 2, 10]
+                let i = options.firstIndex(of: camera.selfTimerSeconds) ?? 0
+                camera.selfTimerSeconds = options[(i + 1) % options.count]
+                camera.show(camera.selfTimerSeconds == 0 ? "Self-timer off" : "Self-timer \(camera.selfTimerSeconds)s")
+            } label: {
+                VStack(spacing: 0) {
+                    Image(systemName: "timer").font(.title2)
+                    if camera.selfTimerSeconds > 0 {
+                        Text("\(camera.selfTimerSeconds)s").font(.caption2.bold())
+                    }
+                }
+                .frame(width: 56, height: 56)
+            }
+            .foregroundStyle(camera.selfTimerSeconds > 0 ? theme.accent : theme.primary)
         }
     }
 
+    private var stackProgress: Double {
+        guard camera.isStacking, let target = camera.stackFrameTarget, target > 0 else { return 0 }
+        return min(1, Double(camera.stackFrames) / Double(target))
+    }
+
     private var shutterButton: some View {
-        Button {
-            if intervalometer.isRunning {
-                intervalometer.stop()
-            } else {
-                camera.capture()
-            }
-        } label: {
+        Button(action: shutter) {
             ZStack {
                 Circle()
-                    .stroke(theme.primary, lineWidth: 4)
+                    .stroke(theme.primary.opacity(camera.isStacking ? 0.3 : 1), lineWidth: 4)
                     .frame(width: 74, height: 74)
-                if intervalometer.isRunning {
+                if camera.isStacking {
+                    Circle()
+                        .trim(from: 0, to: camera.stackFrameTarget == nil ? 1 : stackProgress)
+                        .stroke(theme.accent, style: StrokeStyle(lineWidth: 4, lineCap: .round))
+                        .rotationEffect(.degrees(-90))
+                        .frame(width: 74, height: 74)
+                }
+                if camera.isStacking || intervalometer.isRunning {
                     RoundedRectangle(cornerRadius: 6)
                         .fill(theme.accent)
                         .frame(width: 28, height: 28)
+                } else if let remaining = camera.timerRemaining {
+                    Text("\(remaining)")
+                        .font(.title.bold().monospacedDigit())
+                        .foregroundStyle(theme.accent)
                 } else {
                     Circle()
-                        .fill(camera.isCapturing ? theme.secondary : theme.primary)
+                        .fill(camera.isCapturing ? theme.secondary : (camera.isLongExposure ? theme.accent : theme.primary))
                         .frame(width: 60, height: 60)
                 }
             }
         }
         .disabled(camera.isCapturing && !intervalometer.isRunning)
-    }
-}
-
-struct SettingsPanel: View {
-    @ObservedObject var camera: CameraController
-    @Binding var selected: CameraSetting
-    let theme: Theme
-
-    var body: some View {
-        VStack(spacing: 10) {
-            HStack(spacing: 6) {
-                ForEach(CameraSetting.allCases) { setting in
-                    Button {
-                        selected = setting
-                    } label: {
-                        VStack(spacing: 2) {
-                            Text(setting.rawValue)
-                                .font(.caption2)
-                            Text(valueText(setting))
-                                .font(.system(.footnote, design: .monospaced).bold())
-                                .lineLimit(1)
-                                .minimumScaleFactor(0.7)
-                        }
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 6)
-                        .background(
-                            RoundedRectangle(cornerRadius: 8)
-                                .stroke(selected == setting ? theme.accent : Color.clear, lineWidth: 1)
-                        )
-                    }
-                    .foregroundStyle(selected == setting ? theme.accent : theme.primary)
-                }
-            }
-
-            HStack(spacing: 12) {
-                Button {
-                    setAuto(selected, !isAuto(selected))
-                } label: {
-                    Text(isAuto(selected) ? "AUTO" : "MANUAL")
-                        .font(.caption.bold())
-                        .frame(width: 72)
-                        .padding(.vertical, 6)
-                        .background(Capsule().fill(isAuto(selected) ? theme.accent.opacity(0.25) : Color.white.opacity(0.08)))
-                }
-                .foregroundStyle(isAuto(selected) ? theme.accent : theme.primary)
-
-                slider(for: selected)
-            }
-        }
-    }
-
-    private func valueText(_ setting: CameraSetting) -> String {
-        let prefix = isAuto(setting) ? "A " : ""
-        switch setting {
-        case .iso: return prefix + Formatters.whole(camera.iso)
-        case .shutter: return prefix + Formatters.shutter(camera.exposureSeconds)
-        case .focus: return prefix + String(format: "%.2f", camera.lensPosition)
-        case .whiteBalance: return prefix + Formatters.whole(camera.whiteBalanceKelvin) + "K"
-        }
-    }
-
-    private func isAuto(_ setting: CameraSetting) -> Bool {
-        switch setting {
-        case .iso, .shutter: return camera.autoExposure
-        case .focus: return camera.autoFocus
-        case .whiteBalance: return camera.autoWhiteBalance
-        }
-    }
-
-    private func setAuto(_ setting: CameraSetting, _ on: Bool) {
-        switch setting {
-        case .iso, .shutter: camera.setAutoExposure(on)
-        case .focus: camera.setAutoFocus(on)
-        case .whiteBalance: camera.setAutoWhiteBalance(on)
-        }
-    }
-
-    @ViewBuilder
-    private func slider(for setting: CameraSetting) -> some View {
-        switch setting {
-        case .iso:
-            LogSlider(value: Double(camera.iso),
-                      range: Double(camera.isoRange.lowerBound)...Double(camera.isoRange.upperBound)) {
-                camera.setISO(Float($0))
-            }
-        case .shutter:
-            LogSlider(value: camera.exposureSeconds, range: camera.exposureRange) {
-                camera.setExposure($0)
-            }
-        case .focus:
-            HStack(spacing: 6) {
-                Image(systemName: "camera.macro").font(.caption)
-                Slider(value: Binding(get: { Double(camera.lensPosition) },
-                                      set: { camera.setLensPosition(Float($0)) }),
-                       in: 0...1)
-                Image(systemName: "mountain.2").font(.caption)
-            }
-            .foregroundStyle(theme.secondary)
-        case .whiteBalance:
-            Slider(value: Binding(get: { Double(camera.whiteBalanceKelvin) },
-                                  set: { camera.setWhiteBalance(Float($0)) }),
-                   in: 2000...10000)
-        }
-    }
-}
-
-/// A slider that moves evenly through stops (ISO, shutter) instead of linearly.
-struct LogSlider: View {
-    let value: Double
-    let range: ClosedRange<Double>
-    let onChange: (Double) -> Void
-
-    var body: some View {
-        let lower = log(max(range.lowerBound, 1e-9))
-        let upper = max(log(max(range.upperBound, 1e-9)), lower + 0.001)
-        Slider(value: Binding(get: { log(max(value, 1e-9)) },
-                              set: { onChange(exp($0)) }),
-               in: lower...upper)
     }
 }
