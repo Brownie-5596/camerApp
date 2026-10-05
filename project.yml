@@ -1,0 +1,22 @@
+name: CamerApp
+options:
+  bundleIdPrefix: com.brownie
+  deploymentTarget:
+    iOS: "17.0"
+settings:
+  base:
+    MARKETING_VERSION: "0.1"
+    CURRENT_PROJECT_VERSION: "1"
+    SWIFT_VERSION: "5.0"
+targets:
+  CamerApp:
+    type: application
+    platform: iOS
+    sources: [CamerApp]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.brownie.camerapp
+        INFOPLIST_FILE: CamerApp/Info.plist
+        TARGETED_DEVICE_FAMILY: "1"
+        GENERATE_INFOPLIST_FILE: NO
+    scheme: {}
