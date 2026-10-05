@@ -11,6 +11,8 @@ enum OutputFormat: String, CaseIterable, Identifiable {
     case rawPlusHEIF = "RAW+HEIF"
     var id: String { rawValue }
     var needsRAW: Bool { self != .heif }
+    /// Plain RAW or ProRAW on its own (what the RAW frames mode can save).
+    var isSingleRAW: Bool { self == .raw || self == .proRAW }
 }
 
 enum LightningSensitivity: String, CaseIterable, Identifiable {
@@ -100,11 +102,30 @@ final class CameraController: NSObject, ObservableObject {
     @Published var autoWhiteBalance = true
     @Published var whiteBalanceKelvin: Float = 4000
 
+    // Format, photo size and long-exposure mode keep each other consistent: whatever you
+    // changed last wins, and anything that no longer fits is adjusted with a message.
     @Published var format: OutputFormat = .heif {
-        didSet { UserDefaults.standard.set(format.rawValue, forKey: "format") }
+        didSet {
+            UserDefaults.standard.set(format.rawValue, forKey: "format")
+            guard format != oldValue else { return }
+            if !format.isSingleRAW && stackMode == .rawFrames {
+                stackMode = .average
+                show("\(format.rawValue): long exposures now blend (AVG). RAW frames needs RAW or ProRAW")
+            } else if (format == .raw || format == .rawPlusHEIF) && effectiveMegapixels > 12 {
+                preferredMegapixels = 12
+                show("\(format.rawValue) is 12 MP. For 48 MP RAW use ProRAW")
+            }
+        }
     }
     @Published var stackMode: StackMode = .longExposure {
-        didSet { UserDefaults.standard.set(stackMode.rawValue, forKey: "stackMode") }
+        didSet {
+            UserDefaults.standard.set(stackMode.rawValue, forKey: "stackMode")
+            guard stackMode != oldValue else { return }
+            if stackMode == .rawFrames && !format.isSingleRAW {
+                format = proRAWSupported ? .proRAW : .raw
+                show("RAW frames: each frame saved as \(outputMegapixels) MP \(format.rawValue)")
+            }
+        }
     }
     @Published var selfTimerSeconds = 0 {
         didSet { UserDefaults.standard.set(selfTimerSeconds, forKey: "selfTimer") }
@@ -115,10 +136,16 @@ final class CameraController: NSObject, ObservableObject {
             if lightningArmed { setLightning(true) }
         }
     }
-    /// Full sensor resolution (48 MP on Pro iPhones) for HEIF photos.
     /// Preferred photo size in megapixels. Lenses that can't do it use the nearest smaller size.
     @Published var preferredMegapixels = 12 {
-        didSet { UserDefaults.standard.set(preferredMegapixels, forKey: "megapixels") }
+        didSet {
+            UserDefaults.standard.set(preferredMegapixels, forKey: "megapixels")
+            guard preferredMegapixels != oldValue else { return }
+            if effectiveMegapixels > 12 && (format == .raw || format == .rawPlusHEIF) && proRAWSupported {
+                format = .proRAW
+                show("\(effectiveMegapixels) MP RAW is ProRAW. Switched to ProRAW")
+            }
+        }
     }
     @Published var saveLocation = true {
         didSet {
@@ -130,6 +157,8 @@ final class CameraController: NSObject, ObservableObject {
     /// e.g. "48 MP" when the lens can shoot above 12 MP.
     /// Photo sizes the current lens offers, e.g. [12, 24, 48].
     @Published var availableMegapixels: [Int] = [12]
+    /// Size of blended long exposures (built from the video frames).
+    @Published var stackMegapixels = 12
     @Published var proRAWSupported = false
     /// Digital zoom on top of the selected lens (pinch the preview).
     @Published var zoomFactor: CGFloat = 1
@@ -173,6 +202,9 @@ final class CameraController: NSObject, ObservableObject {
         }
         frameProcessor.onHistogram = { [weak self] in self?.histogram = $0 }
         frameProcessor.onPeaking = { [weak self] in self?.peakingImage = $0 }
+        // Settings saved by an older version might not fit together; tidy them up.
+        if format == .raw || format == .rawPlusHEIF { preferredMegapixels = min(preferredMegapixels, 12) }
+        if stackMode == .rawFrames && !format.isSingleRAW { format = .proRAW }
     }
 
     // MARK: - Derived exposure state
@@ -387,8 +419,11 @@ final class CameraController: NSObject, ObservableObject {
             "Max zoom: \(newDevice.maxAvailableVideoZoomFactor)",
         ]
         if #available(iOS 18.0, *) {
-            report.append("Camera Control: supported \(session.supportsControls), max controls \(session.maxControlsCount), installed \(session.controls.count)")
+            report.append("Camera Control: supported \(session.supportsControls), max controls \(session.maxControlsCount)")
         }
+        // Stacks use the video frames, halved if they're bigger than 16 MP.
+        let frameArea = Int(formatSize.width) * Int(formatSize.height)
+        let stackMP = (frameArea > 16_000_000 ? frameArea / 4 : frameArea) / 1_000_000
         sessionReport.set(report.joined(separator: "\n"))
 
         DispatchQueue.main.async {
@@ -402,6 +437,7 @@ final class CameraController: NSObject, ObservableObject {
             self.maxDeviceExposure = maxExposure
             self.shutterStops = shutterStops
             self.availableMegapixels = megapixelChoices.isEmpty ? [12] : megapixelChoices
+            self.stackMegapixels = max(stackMP, 1)
             self.proRAWSupported = hasProRAW
             self.zoomFactor = 1
             self.maxZoomFactor = maxZoom
@@ -846,7 +882,7 @@ final class CameraController: NSObject, ObservableObject {
         if lightningArmed { setLightning(false) }
         let frames = plannedFrames
         // Follow the chosen format if it's a RAW one; otherwise use the best RAW available.
-        let rawFormat: OutputFormat = format == .raw || !proRAWSupported ? .raw : .proRAW
+        let rawFormat = rawFramesFormat
         isStacking = true
         stackFrames = 0
         stackFrameTarget = frames
@@ -871,13 +907,7 @@ final class CameraController: NSObject, ObservableObject {
 
     private func capturePhoto(formatOverride: OutputFormat? = nil, completion: @escaping (Bool) -> Void) {
         let format = formatOverride ?? self.format
-        // Plain (Bayer) RAW is a 12 MP readout; ProRAW comes in 12 or 48 MP; HEIF in any size.
-        let megapixels: Int
-        switch format {
-        case .raw, .rawPlusHEIF: megapixels = availableMegapixels.first ?? 12
-        case .proRAW: megapixels = effectiveMegapixels > 12 ? (availableMegapixels.last ?? 12) : (availableMegapixels.first ?? 12)
-        case .heif: megapixels = effectiveMegapixels
-        }
+        let megapixels = self.megapixels(for: format)
         let highResolution = megapixels > 13
         let angle = rotationCoordinator?.videoRotationAngleForHorizonLevelCapture
         let fix = location.snapshot(enabled: saveLocation)
@@ -958,13 +988,52 @@ final class CameraController: NSObject, ObservableObject {
         availableMegapixels.filter { $0 <= preferredMegapixels }.max() ?? availableMegapixels.first ?? 12
     }
 
+    /// Plain (Bayer) RAW is a 12 MP readout; ProRAW comes in 12 or 48 MP; HEIF in any size.
+    func megapixels(for format: OutputFormat) -> Int {
+        let smallest = availableMegapixels.first ?? 12
+        switch format {
+        case .raw, .rawPlusHEIF: return smallest
+        case .proRAW: return effectiveMegapixels > 12 ? (availableMegapixels.last ?? smallest) : smallest
+        case .heif: return effectiveMegapixels
+        }
+    }
+
+    /// Size of the next normal photo.
+    var outputMegapixels: Int { megapixels(for: format) }
+
+    /// Format each frame is saved in by the RAW frames long-exposure mode.
+    var rawFramesFormat: OutputFormat {
+        format.isSingleRAW ? format : (proRAWSupported ? .proRAW : .raw)
+    }
+
+    /// What a long exposure will produce, e.g. "12MP HEIF" or "48MP ProRAW frames".
+    var longExposureOutput: String {
+        if stackMode == .rawFrames {
+            return "\(megapixels(for: rawFramesFormat))MP \(rawFramesFormat.rawValue) frames"
+        }
+        return "\(stackMegapixels)MP HEIF"
+    }
+
+    private func cameraControlsReport() -> String {
+        if #available(iOS 18.0, *) {
+            let names = session.controls.compactMap { control -> String? in
+                if let slider = control as? AVCaptureSlider { return slider.localizedTitle }
+                if let picker = control as? AVCaptureIndexPicker { return picker.localizedTitle }
+                return nil
+            }
+            return "Camera Control installed (\(names.count)): \(names.joined(separator: ", "))"
+        }
+        return "Camera Control: needs iOS 18"
+    }
+
     /// Everything useful for diagnosing problems remotely, to paste into a chat.
     func cameraReport() -> String {
         var lines = [
             "\(Metadata.software) on \(Metadata.deviceModel), iOS \(UIDevice.current.systemVersion)",
             sessionReport.get(),
+            cameraControlsReport(),
             "Video frames (used for stacks): \(frameProcessor.frameSize.get())",
-            "Format \(format.rawValue), resolution \(effectiveMegapixels) MP (preferred \(preferredMegapixels)), stack mode \(stackMode.rawValue)",
+            "Format \(format.rawValue), photo size \(outputMegapixels) MP (preferred \(preferredMegapixels)), stack mode \(stackMode.rawValue) → \(longExposureOutput)",
             "ISO \(autoISO ? "auto" : "manual") \(Int(iso)), shutter \(autoShutter ? "auto" : "manual") \(bulb ? "BULB" : Stops.shutterLabel(exposureSeconds)), EV \(Stops.evLabel(evBias)), zoom \(String(format: "%.1f", zoomFactor))×",
             "Focus \(autoFocus ? "auto" : "manual") \(String(format: "%.2f", lensPosition)), WB \(autoWhiteBalance ? "auto" : "manual") \(Int(whiteBalanceKelvin))K",
         ]

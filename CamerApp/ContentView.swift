@@ -201,13 +201,17 @@ struct ContentView: View {
                     camera.format = options[(i + 1) % options.count]
                 }
             }
+            .opacity(blendedLongExposure ? 0.4 : 1)
             if camera.availableMegapixels.count > 1 {
-                chip("\(camera.effectiveMegapixels)MP") {
+                chip("\(camera.outputMegapixels)MP") {
                     let choices = camera.availableMegapixels
-                    let i = choices.firstIndex(of: camera.effectiveMegapixels) ?? 0
+                    let i = choices.firstIndex(of: camera.outputMegapixels) ?? 0
                     camera.preferredMegapixels = choices[(i + 1) % choices.count]
-                    camera.show("Photo size \(camera.effectiveMegapixels) MP")
+                    if camera.lastMessage == nil || !camera.lastMessage!.contains("ProRAW") {
+                        camera.show("Photo size \(camera.outputMegapixels) MP \(camera.format.rawValue)")
+                    }
                 }
+                .opacity(blendedLongExposure ? 0.4 : 1)
             }
             chip(camera.stackMode.shortName) {
                 let modes = StackMode.allCases
@@ -232,6 +236,11 @@ struct ContentView: View {
         }
         .lineLimit(1)
         .foregroundStyle(theme.primary)
+    }
+
+    /// Blended long exposures are always HEIF from the video stream, so the format and size chips don't apply.
+    private var blendedLongExposure: Bool {
+        camera.isLongExposure && camera.stackMode != .rawFrames
     }
 
     private func chip(_ title: String, action: @escaping () -> Void) -> some View {

@@ -88,6 +88,8 @@ struct MeterRow: View {
             if camera.isLongExposure {
                 Text(stackDescription)
                     .font(.system(.caption2, design: .monospaced).bold())
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
                     .padding(.horizontal, 6)
                     .padding(.vertical, 3)
                     .background(Capsule().fill(theme.accent.opacity(0.2)))
@@ -99,10 +101,8 @@ struct MeterRow: View {
 
     private var stackDescription: String {
         let sub = Stops.shutterLabel(camera.subExposure)
-        if let frames = camera.plannedFrames {
-            return "\(camera.stackMode.shortName) \(frames)×\(sub)"
-        }
-        return "\(camera.stackMode.shortName) BULB ×\(sub)"
+        let frames = camera.plannedFrames.map { "\($0)" } ?? "BULB"
+        return "\(camera.stackMode.shortName) \(frames)×\(sub) → \(camera.longExposureOutput)"
     }
 }
 
