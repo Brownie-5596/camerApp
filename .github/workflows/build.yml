@@ -32,6 +32,8 @@ jobs:
             -destination 'generic/platform=iOS' \
             -derivedDataPath build \
             -quiet \
+            MARKETING_VERSION="0.3.${{ github.run_number }}" \
+            CURRENT_PROJECT_VERSION="${{ github.run_number }}" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
@@ -42,6 +44,45 @@ jobs:
           mkdir -p Payload
           cp -R build/Build/Products/Release-iphoneos/CamerApp.app Payload/
           zip -qry CamerApp.ipa Payload
+
+      - name: Write SideStore source
+        run: |
+          cat > source.json <<JSON
+          {
+            "name": "CamerApp",
+            "identifier": "com.brownie.camerapp.source",
+            "apps": [
+              {
+                "name": "CamerApp",
+                "bundleIdentifier": "com.brownie.camerapp",
+                "developerName": "Brownie-5596",
+                "localizedDescription": "Manual camera for aurora, lightning and night sky photography.",
+                "iconURL": "https://github.com/Brownie-5596.png",
+                "versions": [
+                  {
+                    "version": "0.3.${{ github.run_number }}",
+                    "buildVersion": "${{ github.run_number }}",
+                    "date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+                    "localizedDescription": "Build ${GITHUB_SHA::7}",
+                    "downloadURL": "https://github.com/${{ github.repository }}/releases/download/latest/CamerApp.ipa",
+                    "size": $(stat -f%z CamerApp.ipa),
+                    "minOSVersion": "17.0"
+                  }
+                ],
+                "appPermissions": {
+                  "entitlements": [],
+                  "privacy": {
+                    "NSCameraUsageDescription": "Takes photos.",
+                    "NSPhotoLibraryAddUsageDescription": "Saves photos.",
+                    "NSLocationWhenInUseUsageDescription": "Records where photos were taken."
+                  }
+                }
+              }
+            ],
+            "news": []
+          }
+          JSON
+          python3 -m json.tool source.json > /dev/null
 
       - uses: actions/upload-artifact@v4
         with:
@@ -54,7 +95,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release delete latest --yes --cleanup-tag || true
-          gh release create latest CamerApp.ipa \
+          gh release create latest CamerApp.ipa source.json \
             --title "Latest build" \
             --notes "Built from ${GITHUB_SHA::7} on ${GITHUB_REF_NAME}" \
             --target "$GITHUB_SHA" \
