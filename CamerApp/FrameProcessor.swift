@@ -13,28 +13,33 @@ final class FrameProcessor: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
     /// Called on the main thread. `nil` clears the overlay.
     var onPeaking: ((CGImage?) -> Void)?
 
+    /// Metadata for an encoded image: (frame count, width, height) → properties.
+    typealias MetadataBuilder = (_ frames: Int, _ width: Int, _ height: Int) -> [String: Any]
+
     private let ciContext = CIContext(options: [.cacheIntermediates: false])
 
     private final class StackJob {
         let stacker: Stacker
         let total: Int?
-        let orientation: CGImagePropertyOrientation
+        let metadata: MetadataBuilder
         let progress: (Int) -> Void
+        let framesDone: (Int) -> Void
         let completion: (Data?, Int) -> Void
 
-        init(stacker: Stacker, total: Int?, orientation: CGImagePropertyOrientation,
-             progress: @escaping (Int) -> Void, completion: @escaping (Data?, Int) -> Void) {
+        init(stacker: Stacker, total: Int?, metadata: @escaping MetadataBuilder, progress: @escaping (Int) -> Void,
+             framesDone: @escaping (Int) -> Void, completion: @escaping (Data?, Int) -> Void) {
             self.stacker = stacker
             self.total = total
-            self.orientation = orientation
+            self.metadata = metadata
             self.progress = progress
+            self.framesDone = framesDone
             self.completion = completion
         }
     }
 
     private struct LightningWatch {
         let threshold: Float
-        let orientation: CGImagePropertyOrientation
+        let metadata: MetadataBuilder
         let onCatch: (Data?) -> Void
         var baseline: Float?
         var cooldownUntil: CFTimeInterval = 0
@@ -65,16 +70,22 @@ final class FrameProcessor: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
     }
 
     /// Starts stacking the next `frames` frames, or until `finishStack()` when `frames` is nil.
-    /// `progress` and `completion` are called on the main thread.
-    func startStack(mode: StackMode, frames: Int?, orientation: CGImagePropertyOrientation,
-                    progress: @escaping (Int) -> Void, completion: @escaping (Data?, Int) -> Void) {
+    /// `framesDone` fires as soon as collecting stops (so the next shot can begin);
+    /// `completion` fires once the image is encoded. All callbacks run on the main thread.
+    func startStack(mode: StackMode, frames: Int?, metadata: @escaping MetadataBuilder,
+                    progress: @escaping (Int) -> Void,
+                    framesDone: @escaping (Int) -> Void,
+                    completion: @escaping (Data?, Int) -> Void) {
         queue.async {
             guard self.job == nil else {
-                DispatchQueue.main.async { completion(nil, 0) }
+                DispatchQueue.main.async {
+                    framesDone(0)
+                    completion(nil, 0)
+                }
                 return
             }
-            self.job = StackJob(stacker: Stacker(mode: mode), total: frames, orientation: orientation,
-                                progress: progress, completion: completion)
+            self.job = StackJob(stacker: Stacker(mode: mode), total: frames, metadata: metadata,
+                                progress: progress, framesDone: framesDone, completion: completion)
         }
     }
 
@@ -84,10 +95,10 @@ final class FrameProcessor: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
 
     /// Pass a threshold to watch for sudden brightness jumps, or nil to stop watching.
     /// `onCatch` is called on the main thread with the encoded image.
-    func setLightning(threshold: Float?, orientation: CGImagePropertyOrientation, onCatch: @escaping (Data?) -> Void) {
+    func setLightning(threshold: Float?, metadata: @escaping MetadataBuilder, onCatch: @escaping (Data?) -> Void) {
         queue.async {
             if let threshold {
-                self.lightning = LightningWatch(threshold: threshold, orientation: orientation, onCatch: onCatch)
+                self.lightning = LightningWatch(threshold: threshold, metadata: metadata, onCatch: onCatch)
             } else {
                 self.lightning = nil
             }
@@ -144,10 +155,11 @@ final class FrameProcessor: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
     private func completeJob() {
         guard let job else { return }
         self.job = nil
-        // Encoding a full-resolution image takes a moment; keep the live view running meanwhile.
+        let count = job.stacker.count
+        DispatchQueue.main.async { job.framesDone(count) }
+        // Encoding a full-resolution image takes a moment; keep the live view (and the next stack) running.
         DispatchQueue.global(qos: .userInitiated).async {
-            let data = job.stacker.makeHEIF(orientation: job.orientation)
-            let count = job.stacker.count
+            let data = job.stacker.makeHEIF { width, height in job.metadata(count, width, height) }
             DispatchQueue.main.async { job.completion(data, count) }
         }
     }
@@ -160,8 +172,8 @@ final class FrameProcessor: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
             watch.cooldownUntil = now + 0.6 + 1.0
             lightning = watch
             let onCatch = watch.onCatch
-            let burst = StackJob(stacker: Stacker(mode: .brightest), total: frames, orientation: watch.orientation,
-                                 progress: { _ in }, completion: { data, _ in onCatch(data) })
+            let burst = StackJob(stacker: Stacker(mode: .brightest), total: frames, metadata: watch.metadata,
+                                 progress: { _ in }, framesDone: { _ in }, completion: { data, _ in onCatch(data) })
             burst.stacker.add(frame)
             job = burst
         } else {

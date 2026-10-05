@@ -19,12 +19,16 @@ struct ContentView: View {
     @State private var selectedSetting: CameraSetting = .shutter
     @State private var showIntervalometer = false
     @State private var showSettings = false
+    @State private var showPresets = false
     @State private var tapPoint: CGPoint?
+    @State private var burstTask: Task<Void, Never>?
+    @State private var burstCount = 0
 
     private var theme: Theme { Theme(redMode: redMode) }
 
     private var keepAwake: Bool {
         intervalometer.isRunning || camera.isStacking || camera.lightningArmed || camera.timerRemaining != nil
+            || burstTask != nil
     }
 
     var body: some View {
@@ -62,11 +66,38 @@ struct ContentView: View {
                 .presentationDetents([.medium])
                 .presentationBackground(.black)
         }
+        .sheet(isPresented: $showPresets) {
+            PresetsSheet(camera: camera, theme: theme)
+                .presentationBackground(.black)
+        }
         .sheet(isPresented: $showSettings) {
             SettingsSheet(camera: camera, theme: theme, showGrid: $showGrid, showLevel: $showLevel,
                           showHistogram: $showHistogram, peaking: $peaking)
                 .presentationBackground(.black)
         }
+    }
+
+    /// Hold the shutter button to shoot continuously until you let go.
+    private func startBurst() {
+        guard burstTask == nil, !intervalometer.isRunning, !camera.isStacking, camera.timerRemaining == nil else { return }
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        burstCount = 0
+        burstTask = Task { @MainActor in
+            while !Task.isCancelled {
+                let ok = await camera.takePictureAsync()
+                if !ok { break }
+                burstCount += 1
+            }
+        }
+    }
+
+    private func stopBurst() {
+        guard let task = burstTask else { return }
+        task.cancel()
+        burstTask = nil
+        // Releasing during a stacked exposure ends it and keeps what was collected.
+        if camera.isStacking { camera.finishStack() }
+        if burstCount > 0 { camera.show("Burst: \(burstCount) shots") }
     }
 
     /// Shutter button, volume buttons and Camera Control.
@@ -197,6 +228,9 @@ struct ContentView: View {
             }
             return String(format: "BULB %.0fs · press shutter to end", elapsed)
         }
+        if burstTask != nil {
+            return "Burst · \(burstCount) shots"
+        }
         if intervalometer.isRunning {
             return intervalometer.statusText
         }
@@ -221,6 +255,16 @@ struct ContentView: View {
 
     private var lensPicker: some View {
         HStack(spacing: 12) {
+            Button {
+                showPresets = true
+            } label: {
+                Text("MODES")
+                    .font(.system(.caption2, design: .monospaced).bold())
+                    .frame(width: 56, height: 32)
+                    .overlay(Capsule().stroke(theme.primary, lineWidth: 1))
+            }
+            .foregroundStyle(theme.primary)
+            Spacer()
             ForEach(camera.lenses) { lens in
                 Button {
                     camera.selectLens(lens.id)
@@ -232,6 +276,8 @@ struct ContentView: View {
                 }
                 .foregroundStyle(lens.id == camera.currentLensID ? theme.accent : theme.primary)
             }
+            Spacer()
+            Color.clear.frame(width: 56, height: 32)
         }
     }
 
@@ -274,33 +320,39 @@ struct ContentView: View {
     }
 
     private var shutterButton: some View {
-        Button(action: shutter) {
-            ZStack {
+        ZStack {
+            Circle()
+                .stroke(theme.primary.opacity(camera.isStacking ? 0.3 : 1), lineWidth: 4)
+                .frame(width: 74, height: 74)
+            if camera.isStacking {
                 Circle()
-                    .stroke(theme.primary.opacity(camera.isStacking ? 0.3 : 1), lineWidth: 4)
+                    .trim(from: 0, to: camera.stackFrameTarget == nil ? 1 : stackProgress)
+                    .stroke(theme.accent, style: StrokeStyle(lineWidth: 4, lineCap: .round))
+                    .rotationEffect(.degrees(-90))
                     .frame(width: 74, height: 74)
-                if camera.isStacking {
-                    Circle()
-                        .trim(from: 0, to: camera.stackFrameTarget == nil ? 1 : stackProgress)
-                        .stroke(theme.accent, style: StrokeStyle(lineWidth: 4, lineCap: .round))
-                        .rotationEffect(.degrees(-90))
-                        .frame(width: 74, height: 74)
-                }
-                if camera.isStacking || intervalometer.isRunning {
-                    RoundedRectangle(cornerRadius: 6)
-                        .fill(theme.accent)
-                        .frame(width: 28, height: 28)
-                } else if let remaining = camera.timerRemaining {
-                    Text("\(remaining)")
-                        .font(.title.bold().monospacedDigit())
-                        .foregroundStyle(theme.accent)
-                } else {
-                    Circle()
-                        .fill(camera.isCapturing ? theme.secondary : (camera.isLongExposure ? theme.accent : theme.primary))
-                        .frame(width: 60, height: 60)
-                }
+            }
+            if camera.isStacking || intervalometer.isRunning {
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(theme.accent)
+                    .frame(width: 28, height: 28)
+            } else if let remaining = camera.timerRemaining {
+                Text("\(remaining)")
+                    .font(.title.bold().monospacedDigit())
+                    .foregroundStyle(theme.accent)
+            } else {
+                Circle()
+                    .fill(camera.isCapturing || burstTask != nil
+                          ? theme.secondary
+                          : (camera.isLongExposure ? theme.accent : theme.primary))
+                    .frame(width: 60, height: 60)
             }
         }
-        .disabled(camera.isCapturing && !intervalometer.isRunning)
+        .contentShape(Circle())
+        .onTapGesture(perform: shutter)
+        .onLongPressGesture(minimumDuration: 0.4, perform: startBurst) { pressing in
+            if !pressing { stopBurst() }
+        }
+        .accessibilityAddTraits(.isButton)
+        .accessibilityLabel("Shutter")
     }
 }

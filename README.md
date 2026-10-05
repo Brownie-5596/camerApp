@@ -22,11 +22,25 @@ iPhones can only expose for about 1 second at a time. The shutter dial keeps goi
 - **Brightest**: keeps the brightest pixels (star trails, lightning, fireworks).
 
 **Shooting tools**
-- Self-timer (2s or 10s) and an intervalometer (delay, interval, number of shots or unlimited).
-  The intervalometer works with long exposures too.
+- Scene modes (MODES button): Aurora, Aurora (low noise), Milky Way, Night lightning,
+  Day/dusk lightning, Star trails, Auto, plus three custom slots (C1–C3) that save your settings.
+- Intervalometer: start delay, interval from **Continuous** (back-to-back) up to 1 hour,
+  number of shots or unlimited. Works with stacked long exposures.
+- Hold the shutter button for a burst. Self-timer (2s or 10s).
 - Lightning trigger: watches for sudden flashes and saves them automatically.
-- Volume buttons work as a shutter release. On iPhone 16 and later, Camera Control takes a
-  photo and adjusts shutter, ISO, EV, focus and white balance.
+- Volume buttons work as a shutter release.
+- 48 MP full-resolution HEIF on Pro iPhones.
+
+**Camera Control (iPhone 16 and later)**
+Press to shoot. Light-press to show a control and slide to change it; light-press twice to
+switch between Shutter, ISO, Focus, Exposure, Lens, White balance, Long exposure mode and
+Lightning trigger.
+
+**Metadata like the built-in Camera**
+GPS position, altitude, compass direction and speed; iPhone model, lens, focal length
+(and 35 mm equivalent), aperture, shutter speed, ISO, exposure program, white balance,
+date/time with time zone and resolution. Stacked and lightning shots get the same details,
+with the total exposure time and how many frames were combined.
 
 **Live view**
 - Histogram, focus peaking, 5× magnifier, rule-of-thirds grid, horizon level.

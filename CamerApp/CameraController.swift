@@ -1,5 +1,6 @@
 import AVFoundation
 import Combine
+import CoreLocation
 import ImageIO
 import UIKit
 
@@ -34,7 +35,7 @@ struct LensOption: Identifiable, Hashable {
 
 /// Owns the capture session and behaves like the brain of a manual camera:
 /// metering modes, a shutter dial that continues past the sensor limit by stacking,
-/// self-timer, magnifier and lightning trigger.
+/// self-timer, magnifier, lightning trigger and photo metadata.
 ///
 /// Published properties are only touched on the main thread; device work runs on `sessionQueue`.
 final class CameraController: NSObject, ObservableObject {
@@ -45,22 +46,28 @@ final class CameraController: NSObject, ObservableObject {
     private let sessionQueue = DispatchQueue(label: "camerapp.session")
     private let photoOutput = AVCapturePhotoOutput()
     private let videoOutput = AVCaptureVideoDataOutput()
+    private let location = LocationService()
 
     // Session-queue state
     private var device: AVCaptureDevice?
     private var videoInput: AVCaptureDeviceInput?
     private var devicesByID: [String: AVCaptureDevice] = [:]
     private var rawFormatType: OSType?
+    private var standardPhotoDimensions: CMVideoDimensions?
+    private var largestPhotoDimensions: CMVideoDimensions?
     private var inFlight: [Int64: PhotoCaptureProcessor] = [:]
     private var cameraControls: AnyObject?
 
     // Main-thread state
     private var uiDevice: AVCaptureDevice?
+    private var lensInfo: LensInfo?
     private var rotationCoordinator: AVCaptureDevice.RotationCoordinator?
     private var meterTimer: Timer?
     private var started = false
     private var lastExposureChange: CFTimeInterval = 0
     private var timerTask: Task<Void, Never>?
+    /// Settings the lightning trigger stamps into its photos; read from the frame queue.
+    private let lightningShotInfo = Locked<ShotInfo?>(nil)
 
     @Published var permissionDenied = false
     @Published var lenses: [LensOption] = []
@@ -102,7 +109,19 @@ final class CameraController: NSObject, ObservableObject {
             if lightningArmed { setLightning(true) }
         }
     }
+    /// Full sensor resolution (48 MP on Pro iPhones) for HEIF photos.
+    @Published var useHighResolution = false {
+        didSet { UserDefaults.standard.set(useHighResolution, forKey: "highResolution") }
+    }
+    @Published var saveLocation = true {
+        didSet {
+            UserDefaults.standard.set(saveLocation, forKey: "saveLocation")
+            if saveLocation { location.start() } else { location.stop() }
+        }
+    }
     @Published var rawSupported = false
+    /// e.g. "48 MP" when the lens can shoot above 12 MP.
+    @Published var highResolutionLabel: String?
 
     @Published var magnifierOn = false
     @Published var isCapturing = false
@@ -124,6 +143,10 @@ final class CameraController: NSObject, ObservableObject {
         stackMode = StackMode(rawValue: defaults.string(forKey: "stackMode") ?? "") ?? .longExposure
         selfTimerSeconds = defaults.integer(forKey: "selfTimer")
         lightningSensitivity = LightningSensitivity(rawValue: defaults.string(forKey: "lightningSensitivity") ?? "") ?? .medium
+        useHighResolution = defaults.bool(forKey: "highResolution")
+        if defaults.object(forKey: "saveLocation") != nil {
+            saveLocation = defaults.bool(forKey: "saveLocation")
+        }
         frameProcessor.onHistogram = { [weak self] in self?.histogram = $0 }
         frameProcessor.onPeaking = { [weak self] in self?.peakingImage = $0 }
     }
@@ -152,11 +175,20 @@ final class CameraController: NSObject, ObservableObject {
         return Float(log2(Double(frames)))
     }
 
+    /// EXIF exposure program: 1 manual, 2 program, 4 shutter priority.
+    private var exposureProgram: Int {
+        if fullAuto { return 2 }
+        if autoISO { return 4 }
+        if autoShutter { return 2 }
+        return 1
+    }
+
     // MARK: - Lifecycle
 
     func start() {
         guard !started else { return }
         started = true
+        if saveLocation { location.start() }
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized:
             configure()
@@ -185,7 +217,7 @@ final class CameraController: NSObject, ObservableObject {
                 (order.firstIndex(of: $0.deviceType) ?? 0) < (order.firstIndex(of: $1.deviceType) ?? 0)
             }
             for d in devices { self.devicesByID[d.uniqueID] = d }
-            let options = devices.map { LensOption(id: $0.uniqueID, name: Self.lensName(for: $0)) }
+            let options = Self.lensOptions(for: devices)
 
             self.session.beginConfiguration()
             self.session.sessionPreset = .photo
@@ -205,16 +237,39 @@ final class CameraController: NSObject, ObservableObject {
             if let initial = devices.first(where: { $0.deviceType == .builtInWideAngleCamera }) ?? devices.first {
                 self.switchTo(initial)
             }
+
+            if #available(iOS 18.0, *) {
+                let controls = CameraControlsManager(camera: self, lenses: options)
+                controls.install(on: self.session)
+                self.cameraControls = controls
+            }
+
             self.session.startRunning()
         }
     }
 
-    private static func lensName(for device: AVCaptureDevice) -> String {
-        switch device.deviceType {
-        case .builtInUltraWideCamera: return "0.5×"
-        case .builtInWideAngleCamera: return "1×"
-        case .builtInTelephotoCamera: return "Tele"
-        default: return device.localizedName
+    /// Names lenses by zoom relative to the main camera, e.g. 0.5×, 1×, 5×.
+    private static func lensOptions(for devices: [AVCaptureDevice]) -> [LensOption] {
+        let wide = devices.first { $0.deviceType == .builtInWideAngleCamera }
+        let wideTan = wide.map { tan(Double($0.activeFormat.videoFieldOfView) * .pi / 360) }
+        return devices.map { device in
+            var name: String
+            switch device.deviceType {
+            case .builtInUltraWideCamera: name = "0.5×"
+            case .builtInWideAngleCamera: name = "1×"
+            case .builtInTelephotoCamera: name = "Tele"
+            default: name = device.localizedName
+            }
+            let fov = Double(device.activeFormat.videoFieldOfView)
+            if let wideTan, fov > 0, device.deviceType != .builtInWideAngleCamera {
+                let zoom = wideTan / tan(fov * .pi / 360)
+                if zoom < 0.95 {
+                    name = String(format: "%.1f×", zoom)
+                } else if zoom > 1.05 {
+                    name = abs(zoom - zoom.rounded()) < 0.15 ? "\(Int(zoom.rounded()))×" : String(format: "%.1f×", zoom)
+                }
+            }
+            return LensOption(id: device.uniqueID, name: name)
         }
     }
 
@@ -246,6 +301,19 @@ final class CameraController: NSObject, ObservableObject {
         guard device === newDevice else { return }
 
         photoOutput.maxPhotoQualityPrioritization = .quality
+        let photoDimensions = newDevice.activeFormat.supportedMaxPhotoDimensions
+        let area: (CMVideoDimensions) -> Int = { Int($0.width) * Int($0.height) }
+        let largest = photoDimensions.max { area($0) < area($1) }
+        let standard = photoDimensions.filter { area($0) <= 13_000_000 }.max { area($0) < area($1) }
+            ?? photoDimensions.min { area($0) < area($1) }
+        if let largest { photoOutput.maxPhotoDimensions = largest }
+        largestPhotoDimensions = largest
+        standardPhotoDimensions = standard
+        let highResLabel: String? = {
+            guard let largest, let standard, area(largest) > area(standard) else { return nil }
+            return "\(Int((Double(area(largest)) / 1_000_000).rounded())) MP"
+        }()
+
         // Bayer RAW (plain DNG), not Apple ProRAW.
         rawFormatType = photoOutput.availableRawPhotoPixelFormatTypes.first { !AVCapturePhotoOutput.isAppleProRAWPixelFormat($0) }
         let hasRAW = rawFormatType != nil
@@ -256,14 +324,9 @@ final class CameraController: NSObject, ObservableObject {
         let maxExposure = fmt.maxExposureDuration.seconds
         let shutterStops = Stops.shutterStops(minExposure: minExposure, maxExposure: maxExposure)
 
-        if #available(iOS 18.0, *) {
-            let controls = (cameraControls as? CameraControlsManager) ?? CameraControlsManager(camera: self)
-            cameraControls = controls
-            controls.install(on: session, isoStops: isoStops, shutterStops: shutterStops)
-        }
-
         DispatchQueue.main.async {
             self.uiDevice = newDevice
+            self.lensInfo = Metadata.lensInfo(for: newDevice)
             self.currentLensID = newDevice.uniqueID
             self.magnifierOn = false
             self.isoRange = isoRange
@@ -271,6 +334,7 @@ final class CameraController: NSObject, ObservableObject {
             self.minDeviceExposure = minExposure
             self.maxDeviceExposure = maxExposure
             self.shutterStops = shutterStops
+            self.highResolutionLabel = highResLabel
             self.iso = min(max(self.iso, isoRange.lowerBound), isoRange.upperBound)
             if self.autoShutter {
                 self.exposureSeconds = min(max(self.exposureSeconds, minExposure), maxExposure)
@@ -315,17 +379,21 @@ final class CameraController: NSObject, ObservableObject {
         setISO(isoStops[index])
     }
 
-    func setShutterIndex(_ index: Int) {
-        guard shutterStops.indices.contains(index) else { return }
-        switch shutterStops[index] {
+    func setShutter(_ stop: ShutterStop) {
+        switch stop {
         case .bulb:
             bulb = true
         case .time(let t):
             bulb = false
-            exposureSeconds = t
+            exposureSeconds = max(t, minDeviceExposure)
         }
         autoShutter = false
         applyExposure()
+    }
+
+    func setShutterIndex(_ index: Int) {
+        guard shutterStops.indices.contains(index) else { return }
+        setShutter(shutterStops[index])
     }
 
     func setEVBias(_ value: Float) {
@@ -376,6 +444,40 @@ final class CameraController: NSObject, ObservableObject {
             }
         }
     }
+
+    // MARK: - Presets
+
+    func apply(_ preset: CameraPreset) {
+        if isStacking { finishStack() }
+        stackMode = preset.stackMode
+        evBias = preset.evBias
+        autoISO = preset.autoISO
+        if !preset.autoISO { iso = min(max(preset.iso, isoRange.lowerBound), isoRange.upperBound) }
+        autoShutter = preset.autoShutter
+        bulb = !preset.autoShutter && preset.bulb
+        if !preset.autoShutter { exposureSeconds = max(preset.exposureSeconds, minDeviceExposure) }
+        if let autoFocus = preset.autoFocus {
+            self.autoFocus = autoFocus
+            if let position = preset.lensPosition { lensPosition = position }
+        }
+        autoWhiteBalance = preset.autoWhiteBalance
+        if !preset.autoWhiteBalance { whiteBalanceKelvin = preset.kelvin }
+        applyExposure()
+        applyFocus()
+        applyWhiteBalance()
+        if preset.armLightning != lightningArmed { setLightning(preset.armLightning) }
+        show("Mode: \(preset.name)")
+    }
+
+    func currentPreset(slot: String) -> CameraPreset {
+        CameraPreset(id: slot, name: slot, detail: "",
+                     autoISO: autoISO, iso: iso, autoShutter: autoShutter, exposureSeconds: exposureSeconds,
+                     bulb: bulb, evBias: evBias, autoFocus: autoFocus, lensPosition: autoFocus ? nil : lensPosition,
+                     autoWhiteBalance: autoWhiteBalance, kelvin: whiteBalanceKelvin, stackMode: stackMode,
+                     armLightning: lightningArmed)
+    }
+
+    // MARK: - Applying settings to the device
 
     private func withLockedDevice(_ body: @escaping (AVCaptureDevice) -> Void) {
         sessionQueue.async {
@@ -499,6 +601,9 @@ final class CameraController: NSObject, ObservableObject {
             let t = d.temperatureAndTintValues(for: d.deviceWhiteBalanceGains).temperature
             if t.isFinite { whiteBalanceKelvin = t }
         }
+        if lightningArmed {
+            lightningShotInfo.set(shotInfo(frameExposure: autoShutter ? exposureSeconds : subExposure))
+        }
     }
 
     // MARK: - Shutter
@@ -543,7 +648,8 @@ final class CameraController: NSObject, ObservableObject {
     }
 
     /// Takes one picture right now: a normal photo, or a stacked long exposure when the
-    /// shutter speed is longer than the sensor allows.
+    /// shutter speed is longer than the sensor allows. `completion` fires as soon as the
+    /// camera is free for the next shot; saving carries on in the background.
     func takePicture(completion: @escaping (Bool) -> Void = { _ in }) {
         if magnifierOn { setMagnifier(false) }
         if isLongExposure {
@@ -565,32 +671,54 @@ final class CameraController: NSObject, ObservableObject {
         Stops.orientation(forRotationAngle: rotationCoordinator?.videoRotationAngleForHorizonLevelCapture ?? 90)
     }
 
+    private func shotInfo(frameExposure: Double) -> ShotInfo {
+        ShotInfo(date: Date(),
+                 iso: iso,
+                 frameExposure: frameExposure,
+                 exposureProgram: exposureProgram,
+                 evBias: evBias,
+                 manualWhiteBalance: !autoWhiteBalance,
+                 lens: lensInfo ?? LensInfo(model: "\(Metadata.deviceModel) back camera", focalLength: nil,
+                                            focalLength35mm: nil, fNumber: 1.8))
+    }
+
     private func startStack(completion: @escaping (Bool) -> Void) {
         if lightningArmed { setLightning(false) }
         let mode = stackMode
         let sub = subExposure
         let frames = plannedFrames
+        let shot = shotInfo(frameExposure: sub)
+        let orientation = captureOrientation
+        let location = self.location
+        let saveLocation = self.saveLocation
         isStacking = true
         stackFrames = 0
         stackFrameTarget = frames
         stackSubExposure = sub
 
-        frameProcessor.startStack(mode: mode, frames: frames, orientation: captureOrientation, progress: { [weak self] count in
+        frameProcessor.startStack(mode: mode, frames: frames, metadata: { count, width, height in
+            let fix = location.snapshot(enabled: saveLocation)
+            return Metadata.stackedImageProperties(shot: shot, kind: .stack(mode), frames: count,
+                                                   width: width, height: height, orientation: orientation,
+                                                   location: fix.location, heading: fix.heading)
+        }, progress: { [weak self] count in
             self?.stackFrames = count
-        }, completion: { [weak self] data, count in
+        }, framesDone: { [weak self] count in
             guard let self else { return }
             self.isStacking = false
             self.stackFrameTarget = nil
+            completion(count > 0)
+        }, completion: { [weak self] data, count in
+            guard let self else { return }
             guard let data, count > 0 else {
                 self.show("Long exposure failed")
-                completion(false)
                 return
             }
             let total = Stops.shutterLabel(Double(count) * sub)
             let description = mode == .longExposure ? "\(total) long exposure" : "\(total) \(mode.rawValue.lowercased()) stack"
-            PhotoLibrary.save(primary: data, successMessage: "Saved \(description)") { ok, message in
+            let fix = location.snapshot(enabled: saveLocation)
+            PhotoLibrary.save(primary: data, location: fix.location, successMessage: "Saved \(description)") { _, message in
                 self.show(message)
-                completion(ok)
             }
         })
     }
@@ -602,7 +730,11 @@ final class CameraController: NSObject, ObservableObject {
 
     private func capturePhoto(completion: @escaping (Bool) -> Void) {
         let format = self.format
+        let highResolution = useHighResolution && format == .heif
         let angle = rotationCoordinator?.videoRotationAngleForHorizonLevelCapture
+        let fix = location.snapshot(enabled: saveLocation)
+        let gps = fix.location.map { Metadata.gps(location: $0, heading: fix.heading) }
+        let deviceID = currentLensID
         isCapturing = true
 
         sessionQueue.async {
@@ -620,6 +752,9 @@ final class CameraController: NSObject, ObservableObject {
             } else {
                 settings = AVCapturePhotoSettings()
             }
+            if let dimensions = highResolution ? self.largestPhotoDimensions : self.standardPhotoDimensions {
+                settings.maxPhotoDimensions = dimensions
+            }
             // Single frame, no multi-frame fusion, so the exposure you set is the exposure you get.
             settings.photoQualityPrioritization = .speed
             if self.photoOutput.supportedFlashModes.contains(.off) { settings.flashMode = .off }
@@ -630,14 +765,16 @@ final class CameraController: NSObject, ObservableObject {
             }
 
             let id = settings.uniqueID
-            let processor = PhotoCaptureProcessor { success, message in
+            let processor = PhotoCaptureProcessor(gps: gps, location: fix.location, deviceID: deviceID, onCaptured: { success in
                 self.sessionQueue.async { self.inFlight[id] = nil }
                 DispatchQueue.main.async {
                     self.isCapturing = false
-                    self.show(message)
+                    if let device = self.uiDevice { self.lensInfo = Metadata.lensInfo(for: device) }
                     completion(success)
                 }
-            }
+            }, onSaved: { _, message in
+                self.show(message)
+            })
             self.inFlight[id] = processor
             self.photoOutput.capturePhoto(with: settings, delegate: processor)
         }
@@ -651,12 +788,24 @@ final class CameraController: NSObject, ObservableObject {
     }
 
     func setLightning(_ on: Bool) {
+        if on && isStacking { return }
         lightningArmed = on
         if on { lightningCount = 0 }
-        frameProcessor.setLightning(threshold: on ? lightningSensitivity.threshold : nil,
-                                    orientation: captureOrientation) { [weak self] data in
+        lightningShotInfo.set(shotInfo(frameExposure: autoShutter ? exposureSeconds : subExposure))
+        let shotInfoBox = lightningShotInfo
+        let orientation = captureOrientation
+        let location = self.location
+        let saveLocation = self.saveLocation
+        frameProcessor.setLightning(threshold: on ? lightningSensitivity.threshold : nil, metadata: { count, width, height in
+            guard let shot = shotInfoBox.get() else { return [:] }
+            let fix = location.snapshot(enabled: saveLocation)
+            return Metadata.stackedImageProperties(shot: shot, kind: .lightning, frames: count,
+                                                   width: width, height: height, orientation: orientation,
+                                                   location: fix.location, heading: fix.heading)
+        }) { [weak self] data in
             guard let self, let data else { return }
-            PhotoLibrary.save(primary: data, successMessage: "⚡ Lightning saved") { ok, message in
+            let fix = location.snapshot(enabled: saveLocation)
+            PhotoLibrary.save(primary: data, location: fix.location, successMessage: "⚡ Lightning saved") { ok, message in
                 if ok { self.lightningCount += 1 }
                 self.show(message)
             }

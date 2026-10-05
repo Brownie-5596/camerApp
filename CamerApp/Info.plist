@@ -24,6 +24,8 @@
 	<true/>
 	<key>NSCameraUsageDescription</key>
 	<string>CamerApp uses the camera to take photos.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>CamerApp records where each photo was taken, like the built-in Camera app. You can turn this off in the app's settings.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>CamerApp saves your photos to the Photos library.</string>
 	<key>UIApplicationSceneManifest</key>

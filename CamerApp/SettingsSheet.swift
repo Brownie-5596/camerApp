@@ -28,6 +28,22 @@ struct SettingsSheet: View {
                          : "This lens doesn't offer RAW.")
                 }
 
+                if let label = camera.highResolutionLabel {
+                    Section {
+                        Toggle("Full resolution (\(label))", isOn: $camera.useHighResolution)
+                    } footer: {
+                        Text("Uses the whole \(label) sensor for HEIF photos. RAW and stacked shots use the standard resolution.")
+                    }
+                }
+
+                Section {
+                    Toggle("Save location", isOn: $camera.saveLocation)
+                } header: {
+                    Text("Metadata")
+                } footer: {
+                    Text("Photos include GPS position, altitude, compass direction and speed, plus the usual camera details: iPhone model, lens, focal length, aperture, shutter speed, ISO, white balance and resolution. Stacked shots also record how many frames they were built from.")
+                }
+
                 Section {
                     Picker("Mode", selection: $camera.stackMode) {
                         ForEach(StackMode.allCases) { mode in
@@ -73,7 +89,9 @@ struct SettingsSheet: View {
                 }
 
                 Section("Buttons") {
-                    Text("Volume buttons work as a shutter release. On iPhone 16 and later, press Camera Control to shoot, or light-press it to slide through shutter, ISO, exposure, focus and white balance.")
+                    Text("Volume buttons work as a shutter release. Hold the on-screen shutter to shoot a burst.")
+                        .font(.footnote)
+                    Text("Camera Control (iPhone 16 and later): press to shoot. Light-press to show a setting, then slide to change it. Light-press twice to choose which setting: shutter, ISO, focus, exposure, lens, white balance, long exposure mode or lightning trigger.")
                         .font(.footnote)
                     Text("Tap the preview to focus there. With manual focus, a tap focuses once and locks.")
                         .font(.footnote)

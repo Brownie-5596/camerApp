@@ -3,7 +3,7 @@ import Foundation
 import ImageIO
 import UniformTypeIdentifiers
 
-enum StackMode: String, CaseIterable, Identifiable {
+enum StackMode: String, CaseIterable, Identifiable, Codable {
     case longExposure = "Long exposure"
     case average = "Average"
     case brightest = "Brightest"
@@ -97,8 +97,8 @@ final class Stacker {
         count += 1
     }
 
-    /// Encodes the stack as a HEIF image.
-    func makeHEIF(orientation: CGImagePropertyOrientation) -> Data? {
+    /// Encodes the stack as a HEIF image. `properties` receives the pixel size and returns the metadata to embed.
+    func makeHEIF(properties: (_ width: Int, _ height: Int) -> [String: Any]) -> Data? {
         guard let acc = accumulator, count > 0 else { return nil }
         let scale: Float = mode == .average ? 1 / Float(count) : 1
         let pixelCount = width * height
@@ -136,11 +136,7 @@ final class Stacker {
         guard let destination = CGImageDestinationCreateWithData(data, UTType.heic.identifier as CFString, 1, nil) else {
             return nil
         }
-        let properties: [CFString: Any] = [
-            kCGImagePropertyOrientation: orientation.rawValue,
-            kCGImageDestinationLossyCompressionQuality: 0.92,
-        ]
-        CGImageDestinationAddImage(destination, image, properties as CFDictionary)
+        CGImageDestinationAddImage(destination, image, properties(width, height) as CFDictionary)
         guard CGImageDestinationFinalize(destination) else { return nil }
         return data as Data
     }
