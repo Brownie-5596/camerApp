@@ -238,13 +238,24 @@ final class CameraController: NSObject, ObservableObject {
                 self.switchTo(initial)
             }
 
-            if #available(iOS 18.0, *) {
+            // Safety net: if setting up Camera Control crashed the app last time, skip it this time.
+            let defaults = UserDefaults.standard
+            let controlsCrashedBefore = defaults.bool(forKey: "controlsSetupInProgress")
+            if #available(iOS 18.0, *), !controlsCrashedBefore {
+                defaults.set(true, forKey: "controlsSetupInProgress")
+                defaults.synchronize()
                 let controls = CameraControlsManager(camera: self, lenses: options)
                 controls.install(on: self.session)
                 self.cameraControls = controls
             }
 
             self.session.startRunning()
+            if controlsCrashedBefore {
+                DispatchQueue.main.async { self.show("Camera Control setup skipped after a crash") }
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                defaults.set(false, forKey: "controlsSetupInProgress")
+            }
         }
     }
 

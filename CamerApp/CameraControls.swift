@@ -83,13 +83,14 @@ final class CameraControlsManager: NSObject, AVCaptureSessionControlsDelegate {
         if lenses.count > 1 { controls.append(lens) }
         controls += [whiteBalance, stack, lightning]
 
+        // The delegate must be set before any control is added, or AVFoundation throws.
+        session.setControlsDelegate(self, queue: .main)
         session.beginConfiguration()
         for control in session.controls { session.removeControl(control) }
         for control in controls where session.controls.count < session.maxControlsCount {
             if session.canAddControl(control) { session.addControl(control) }
         }
         session.commitConfiguration()
-        session.setControlsDelegate(self, queue: .main)
 
         shutterPicker = shutter
         isoPicker = iso
