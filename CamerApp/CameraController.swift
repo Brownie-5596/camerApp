@@ -116,6 +116,9 @@ final class CameraController: NSObject, ObservableObject {
             } else if (format == .raw || format == .rawPlusHEIF) && effectiveMegapixels > 12 {
                 preferredMegapixels = 12
                 show("\(format.rawValue) is 12 MP. For 48 MP RAW use ProRAW")
+            } else if format == .proRAW && !proRAWSizes.contains(effectiveMegapixels) {
+                preferredMegapixels = proRAWSizes.last ?? 12
+                show("ProRAW comes in \(proRAWSizes.map { "\($0)" }.joined(separator: " or ")) MP. Using \(preferredMegapixels) MP")
             }
         }
     }
@@ -145,9 +148,15 @@ final class CameraController: NSObject, ObservableObject {
         didSet {
             UserDefaults.standard.set(preferredMegapixels, forKey: "megapixels")
             guard preferredMegapixels != oldValue else { return }
-            if effectiveMegapixels > 12 && (format == .raw || format == .rawPlusHEIF) && proRAWSupported {
-                format = .proRAW
-                show("\(effectiveMegapixels) MP RAW is ProRAW. Switched to ProRAW")
+            let size = effectiveMegapixels
+            let proRAWSize = proRAWSupported && proRAWSizes.contains(size)
+            if size > 12 && (format == .raw || format == .rawPlusHEIF) {
+                // Plain RAW is 12 MP only: the latest choice (the size) wins.
+                format = proRAWSize ? .proRAW : .heif
+                show("\(size) MP RAW isn't possible. Switched to \(format.rawValue)")
+            } else if format == .proRAW && !proRAWSizes.contains(size) {
+                format = .heif
+                show("\(size) MP is HEIF only (ProRAW is \(proRAWSizes.map { "\($0)" }.joined(separator: " or ")) MP). Switched to HEIF")
             }
         }
     }
@@ -1233,13 +1242,32 @@ final class CameraController: NSObject, ObservableObject {
         if !exposureAllowsHighResolution { return smallest }
         switch format {
         case .raw, .rawPlusHEIF: return smallest
-        case .proRAW: return effectiveMegapixels > 12 ? (availableMegapixels.last ?? smallest) : smallest
+        case .proRAW: return effectiveMegapixels >= (proRAWSizes.last ?? smallest) ? (proRAWSizes.last ?? smallest) : smallest
         case .heif: return effectiveMegapixels
         }
     }
 
     /// Plain-English advice when the manual settings are well off what the meter wants,
     /// e.g. "Meter +6.6: too bright. Try ISO 100".
+    /// ProRAW comes in the smallest and largest sizes only (12 or 48 MP), not 24.
+    var proRAWSizes: [Int] {
+        let sizes = [availableMegapixels.first ?? 12, availableMegapixels.last ?? 12]
+        return sizes[0] == sizes[1] ? [sizes[0]] : sizes
+    }
+
+    /// Advice for the status line: exposure first, then focus.
+    var shootingHint: String? {
+        exposureHint ?? focusHint
+    }
+
+    /// Autofocus can't lock onto stars; in the dark it drifts to its closest setting and blurs everything.
+    var focusHint: String? {
+        guard autoFocus else { return nil }
+        let frameTime = autoShutter ? exposureSeconds : subExposure
+        guard isLongExposure || frameTime >= 0.25 else { return nil }
+        return "Night: set focus to MF and focus on a bright star (magnifier + peaking)"
+    }
+
     var exposureHint: String? {
         guard !fullAuto, meterEV.isFinite, abs(meterEV) > 1.5 else { return nil }
         let reading = "Meter \(Stops.evLabel(meterEV)): \(meterEV > 0 ? "too bright" : "too dark")"

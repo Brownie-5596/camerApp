@@ -305,7 +305,7 @@ struct ContentView: View {
         let parts = [statusText, camera.rawStackStatus, camera.lastMessage].compactMap { $0 }
         let idle = parts.isEmpty
         // When nothing else is happening, exposure advice beats battery/storage info.
-        if idle, let hint = camera.exposureHint {
+        if idle, let hint = camera.shootingHint {
             return Text(hint)
                 .font(.caption.monospacedDigit())
                 .lineLimit(1)
