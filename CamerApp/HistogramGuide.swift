@@ -71,6 +71,8 @@ struct HistogramGuide: View {
                         Text("Tips").font(.headline)
                         Text("• The check is a guide, not a rule: snow scenes are meant to be bright and night scenes dark.")
                         Text("• For long exposures, the histogram shows the finished photo, not one preview frame.")
+                        Text("• The meter (the scale under the preview) aims for a medium-bright picture. A night sky looks natural around −1 to −2; +3 or more will look gray and washed out.")
+                        Text("• LONG adds every frame together, so a 30-frame LONG is about 5 stops brighter than one frame. Use a much lower ISO than you would for a single shot, or set ISO to Auto.")
                         Text("• Turn on Clipping warning in Settings to see blown-out areas flash pink on the preview.")
                         Text("• Tap the histogram any time to open this guide.")
                     }

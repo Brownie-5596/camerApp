@@ -1238,6 +1238,25 @@ final class CameraController: NSObject, ObservableObject {
         }
     }
 
+    /// Plain-English advice when the manual settings are well off what the meter wants,
+    /// e.g. "Meter +6.6: too bright. Try ISO 100".
+    var exposureHint: String? {
+        guard !fullAuto, meterEV.isFinite, abs(meterEV) > 1.5 else { return nil }
+        let reading = "Meter \(Stops.evLabel(meterEV)): \(meterEV > 0 ? "too bright" : "too dark")"
+        guard !autoISO else {
+            return "\(reading). Use a \(meterEV > 0 ? "shorter" : "longer") shutter"
+        }
+        let wanted = iso * powf(2, -meterEV)
+        if wanted < isoRange.lowerBound * 0.9 {
+            return "\(reading) even at ISO \(Stops.whole(isoRange.lowerBound)). Use a shorter shutter"
+        }
+        if wanted > isoRange.upperBound * 1.1 {
+            return "\(reading) even at ISO \(Stops.whole(isoRange.upperBound)). Use a longer shutter"
+        }
+        let suggestion = isoStops[Stops.nearestIndex(of: wanted, in: isoStops)]
+        return "\(reading). Try ISO \(Stops.whole(suggestion)) (or Auto)"
+    }
+
     /// iOS reads out the whole 48 MP sensor only at about 1/15 s or faster. (Apple's own Night mode
     /// photos are 12 MP for the same reason.)
     static let maxHighResolutionExposure = 1.0 / 15
