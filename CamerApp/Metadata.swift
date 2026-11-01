@@ -274,3 +274,17 @@ final class Locked<Value> {
         lock.unlock()
     }
 }
+
+/// Lets exactly one of several racing callbacks through (e.g. a result versus a timeout).
+final class Once {
+    private var done = false
+    private let lock = NSLock()
+
+    func claim() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if done { return false }
+        done = true
+        return true
+    }
+}

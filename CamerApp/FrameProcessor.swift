@@ -93,6 +93,7 @@ final class FrameProcessor: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
     private var histogramMap = [UInt8](0...255)
     private var job: StackJob?
     private var lightning: LightningWatch?
+    private var sharpnessRequest: (skip: Int, completion: (Double) -> Void)?
     private var lastFrameTime = CMTime.invalid
     private var frameInterval = 1.0 / 30
 
@@ -164,6 +165,66 @@ final class FrameProcessor: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
         }
     }
 
+    /// Star sharpness of an upcoming frame (after skipping `skipFrames`, e.g. while the lens settles).
+    /// Returns 0 if no stars are visible or no frame arrives in time.
+    func sharpness(skipFrames: Int, timeout: Double = 4) async -> Double {
+        await withCheckedContinuation { continuation in
+            let once = Once()
+            let finish: (Double) -> Void = { value in
+                if once.claim() { continuation.resume(returning: value) }
+            }
+            queue.async { self.sharpnessRequest = (skipFrames, finish) }
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { finish(0) }
+        }
+    }
+
+    /// How tightly the stars in the middle of the frame are focused: their brightness above the sky,
+    /// divided by how many pixels they spread over. A star in focus is a small, bright point;
+    /// out of focus it becomes a bigger, dimmer disc.
+    static func starSharpness(_ frame: FrameView) -> Double {
+        var histogram = [Int](repeating: 0, count: 256)
+        let x0 = frame.width * 3 / 10
+        let x1 = frame.width * 7 / 10
+        let y0 = frame.height * 3 / 10
+        let y1 = frame.height * 7 / 10
+        histogram.withUnsafeMutableBufferPointer { counts in
+            for y in y0..<y1 {
+                let row = frame.base + y * frame.bytesPerRow
+                for x in x0..<x1 {
+                    let p = row + x * 4
+                    counts[(Int(p[2]) * 54 + Int(p[1]) * 183 + Int(p[0]) * 19) >> 8] += 1
+                }
+            }
+        }
+        let total = histogram.reduce(0, +)
+        guard total > 0 else { return 0 }
+        var running = 0
+        var sky = 0
+        for value in 0..<256 {
+            running += histogram[value]
+            if running >= total / 2 {
+                sky = value
+                break
+            }
+        }
+        // Brightness of the brightest 64 pixels (the star cores).
+        var wanted = 64
+        var sum = 0
+        var value = 255
+        while wanted > 0 && value >= 0 {
+            let take = min(wanted, histogram[value])
+            sum += take * value
+            wanted -= take
+            value -= 1
+        }
+        let peak = Double(sum) / Double(max(1, 64 - wanted))
+        let contrast = peak - Double(sky)
+        guard contrast > 20 else { return 0 }
+        let half = min(255, Int((Double(sky) + contrast / 2).rounded(.up)))
+        let area = histogram[half...].reduce(0, +)
+        return contrast / Double(max(area, 1)).squareRoot()
+    }
+
     // MARK: - Frames
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
@@ -187,6 +248,16 @@ final class FrameProcessor: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
         if frame.width != lastFrameWidth {
             lastFrameWidth = frame.width
             frameSize.set("\(frame.width)×\(frame.height)")
+        }
+
+        if var request = sharpnessRequest {
+            if request.skip > 0 {
+                request.skip -= 1
+                sharpnessRequest = request
+            } else {
+                sharpnessRequest = nil
+                request.completion(Self.starSharpness(frame))
+            }
         }
 
         if let job {

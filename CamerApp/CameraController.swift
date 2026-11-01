@@ -103,6 +103,9 @@ final class CameraController: NSObject, ObservableObject {
     /// Focus position that makes stars sharp, saved per lens. (1.00 is past infinity on iPhones;
     /// stars are usually sharp somewhere around 0.75–0.85.)
     @Published var starFocus: Float?
+    /// True while the app sweeps the focus looking for the sharpest stars.
+    @Published var findingStarFocus = false
+    @Published var focusSearchStatus: String?
 
     @Published var autoWhiteBalance = true
     @Published var whiteBalanceKelvin: Float = 4000
@@ -863,6 +866,10 @@ final class CameraController: NSObject, ObservableObject {
 
     /// The shutter button, volume buttons and Camera Control all come here.
     func shutterPressed() {
+        if findingStarFocus {
+            show("Finding star focus. Tap STOP to cancel")
+            return
+        }
         if isStacking {
             finishStack()
             return
@@ -1301,6 +1308,99 @@ final class CameraController: NSObject, ObservableObject {
         }
         setLensPosition(starFocus)
         show(String(format: "Star focus %.2f", starFocus))
+    }
+
+    /// Finds star focus automatically: sweeps the focus over the night sky with short, bright frames,
+    /// measures how tightly the stars are focused at each step, then sets and saves the sharpest.
+    /// Needs a tripod and some bright stars near the middle of the picture. Takes about 20–30 s.
+    func findStarFocus() {
+        guard !findingStarFocus, !isStacking else { return }
+        findingStarFocus = true
+        let before = (autoISO: autoISO, autoShutter: autoShutter, bulb: bulb, iso: iso,
+                      exposure: exposureSeconds, autoFocus: autoFocus, focus: lensPosition)
+
+        // Short frames at high ISO, so each focus step only takes a fraction of a second.
+        autoISO = false
+        autoShutter = false
+        bulb = false
+        iso = min(isoRange.upperBound, 6400)
+        exposureSeconds = max(minDeviceExposure, min(0.25, maxDeviceExposure))
+        autoFocus = false
+        applyExposure()
+
+        Task { @MainActor in
+            let coarse = stride(from: 0.55, through: 1.0, by: 0.025).map { Float($0) }
+            var samples: [(position: Float, score: Double)] = []
+            var step = 0
+            let totalSteps = coarse.count + 11
+
+            func measure(_ position: Float) async -> Double {
+                step += 1
+                self.focusSearchStatus = "Finding star focus \(step)/\(totalSteps)…"
+                self.lensPosition = position
+                self.withLockedDevice { d in
+                    if d.isLockingFocusWithCustomLensPositionSupported {
+                        d.setFocusModeLocked(lensPosition: position, completionHandler: nil)
+                    }
+                }
+                try? await Task.sleep(nanoseconds: 150_000_000)
+                // Skip one frame that may have been exposed while the lens was moving.
+                return await self.frameProcessor.sharpness(skipFrames: 1)
+            }
+
+            for position in coarse where self.findingStarFocus {
+                samples.append((position, await measure(position)))
+            }
+            if let roughBest = Self.bestFocus(samples) {
+                let fine = stride(from: -0.03, through: 0.0301, by: 0.006).map { roughBest + Float($0) }
+                for position in fine where self.findingStarFocus && position >= 0 && position <= 1 {
+                    samples.append((position, await measure(position)))
+                }
+            }
+
+            let cancelled = !self.findingStarFocus
+            self.findingStarFocus = false
+            self.focusSearchStatus = nil
+            self.autoISO = before.autoISO
+            self.autoShutter = before.autoShutter
+            self.bulb = before.bulb
+            self.iso = before.iso
+            self.exposureSeconds = before.exposure
+            self.applyExposure()
+
+            if !cancelled, let best = Self.bestFocus(samples) {
+                self.autoFocus = false
+                self.lensPosition = best
+                self.applyFocus()
+                if let id = self.currentLensID {
+                    UserDefaults.standard.set(best, forKey: "starFocus." + id)
+                }
+                self.starFocus = best
+                self.show(String(format: "Star focus found and saved: %.2f", best))
+            } else {
+                self.autoFocus = before.autoFocus
+                self.lensPosition = before.focus
+                self.applyFocus()
+                self.show(cancelled ? "Star focus search stopped"
+                                    : "Couldn't find sharp stars. Aim at clear sky with bright stars in the middle and try again")
+            }
+        }
+    }
+
+    func cancelStarFocusSearch() {
+        findingStarFocus = false
+    }
+
+    /// The focus position with the sharpest stars, or nil if the measurements show no clear peak
+    /// (no stars visible, clouds, or too bright).
+    private static func bestFocus(_ samples: [(position: Float, score: Double)]) -> Float? {
+        guard let best = samples.max(by: { $0.score < $1.score }), best.score > 0 else { return nil }
+        let scores = samples.map(\.score).sorted()
+        let typical = scores[scores.count / 2]
+        guard best.score > typical * 1.2 else { return nil }
+        // Several steps can tie when bright stars saturate; take the middle of the best ones near the peak.
+        let near = samples.filter { $0.score >= best.score * 0.97 && abs($0.position - best.position) <= 0.05 }
+        return near.map(\.position).reduce(0, +) / Float(near.count)
     }
 
     var exposureHint: String? {

@@ -302,7 +302,7 @@ struct ContentView: View {
 
     /// One line under the top bar for everything the camera is telling you.
     private var statusLine: some View {
-        let parts = [statusText, camera.rawStackStatus, camera.lastMessage].compactMap { $0 }
+        let parts = [statusText, camera.focusSearchStatus, camera.rawStackStatus, camera.lastMessage].compactMap { $0 }
         let idle = parts.isEmpty
         // When nothing else is happening, exposure advice beats battery/storage info.
         if idle, let hint = camera.shootingHint {

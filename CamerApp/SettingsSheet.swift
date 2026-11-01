@@ -151,6 +151,8 @@ struct SettingsSheet: View {
                         .font(.footnote)
                     Text("Pinch the preview to zoom; tap the zoom badge to go back to 1×. The ◎ button turns on focus peaking (sharp edges glow green).")
                         .font(.footnote)
+                    Text("Star focus (on the FOCUS dial): FIND sweeps the focus over the night sky for about 20–30 seconds and saves the sharpest setting. Use a tripod with bright stars near the middle of the picture. Tap ★ to return to it; long-press ★ to save your own.")
+                        .font(.footnote)
                     Text("Tap the preview to focus there. With manual focus, a tap focuses once and locks. Long-press the preview (or the AE/AF button) to lock exposure and focus.")
                         .font(.footnote)
                     Text("Tap the thumbnail to open the Photos app.")

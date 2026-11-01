@@ -143,6 +143,21 @@ struct SettingsPanel: View {
                         camera.saveStarFocus()
                     }
                     .accessibilityLabel("Star focus")
+                // Automatic star focus: sweeps the focus and keeps the sharpest stars.
+                Button {
+                    if camera.findingStarFocus {
+                        camera.cancelStarFocusSearch()
+                    } else {
+                        camera.findStarFocus()
+                    }
+                } label: {
+                    Text(camera.findingStarFocus ? "STOP" : "FIND")
+                        .font(.system(size: 10, weight: .bold))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 4)
+                        .overlay(Capsule().stroke(theme.accent, lineWidth: 1))
+                }
+                .foregroundStyle(theme.accent)
             }
             .foregroundStyle(theme.secondary)
         case .whiteBalance:
