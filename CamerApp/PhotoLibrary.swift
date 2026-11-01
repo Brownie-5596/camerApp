@@ -113,26 +113,6 @@ final class PhotoCaptureProcessor: NSObject, AVCapturePhotoCaptureDelegate {
         if let expectedProcessing { text += String(format: " (iOS expected processing up to %.2fs)", expectedProcessing) }
         onTiming(text)
     }
-
-    private static func isPermanent(_ error: Error?) -> Bool {
-        guard let error = error as NSError?, error.domain == PHPhotosErrorDomain else { return false }
-        return [3305, 3310, 3311].contains(error.code)
-    }
-
-    /// Plain-English versions of the Photos errors people actually hit.
-    private static func describe(_ error: Error?) -> String {
-        guard let error = error as NSError? else { return "unknown error" }
-        if error.domain == PHPhotosErrorDomain {
-            switch error.code {
-            case 3305: return "not enough storage on the iPhone. Free up space and try again"
-            case 3301: return "Photos was interrupted (often low storage or too many large files at once)"
-            case 3310, 3311: return "the app isn't allowed to add photos. Check Settings → Privacy → Photos"
-            case 3302, 3303: return "the image file was invalid (code \(error.code))"
-            default: break
-            }
-        }
-        return "\(error.localizedDescription) (code \(error.code))"
-    }
 }
 
 enum PhotoLibrary {
@@ -194,5 +174,25 @@ enum PhotoLibrary {
                 }
             }
         }
+    }
+
+    private static func isPermanent(_ error: Error?) -> Bool {
+        guard let error = error as NSError?, error.domain == PHPhotosErrorDomain else { return false }
+        return [3305, 3310, 3311].contains(error.code)
+    }
+
+    /// Plain-English versions of the Photos errors people actually hit.
+    private static func describe(_ error: Error?) -> String {
+        guard let error = error as NSError? else { return "unknown error" }
+        if error.domain == PHPhotosErrorDomain {
+            switch error.code {
+            case 3305: return "not enough storage on the iPhone. Free up space and try again"
+            case 3301: return "Photos was interrupted (often low storage or too many large files at once)"
+            case 3310, 3311: return "the app isn't allowed to add photos. Check Settings → Privacy → Photos"
+            case 3302, 3303: return "the image file was invalid (code \(error.code))"
+            default: break
+            }
+        }
+        return "\(error.localizedDescription) (code \(error.code))"
     }
 }
