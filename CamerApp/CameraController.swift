@@ -1101,7 +1101,7 @@ final class CameraController: NSObject, ObservableObject {
         let angle = rotationCoordinator?.videoRotationAngleForHorizonLevelCapture
         let fix = location.snapshot(enabled: saveLocation)
         let gps = fix.location.map { Metadata.gps(location: $0, heading: fix.heading) }
-        let settings = settingsSummary(format: format)
+        let settingsNote = settingsSummary(format: format)
         let deviceID = currentLensID
         isCapturing = true
 
@@ -1146,7 +1146,7 @@ final class CameraController: NSObject, ObservableObject {
                 self.isCapturing = false
                 completion(success)
             }
-            let processor = PhotoCaptureProcessor(gps: gps, settings: settings, location: fix.location, deviceID: deviceID, onRAWData: onRAWData, onExposureDone: {
+            let processor = PhotoCaptureProcessor(gps: gps, settings: settingsNote, location: fix.location, deviceID: deviceID, onRAWData: onRAWData, onExposureDone: {
                 DispatchQueue.main.async {
                     counted = true
                     self.processingCount += 1
