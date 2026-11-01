@@ -100,6 +100,9 @@ final class CameraController: NSObject, ObservableObject {
 
     @Published var autoFocus = true
     @Published var lensPosition: Float = 1
+    /// Focus position that makes stars sharp, saved per lens. (1.00 is past infinity on iPhones;
+    /// stars are usually sharp somewhere around 0.75–0.85.)
+    @Published var starFocus: Float?
 
     @Published var autoWhiteBalance = true
     @Published var whiteBalanceKelvin: Float = 4000
@@ -503,6 +506,7 @@ final class CameraController: NSObject, ObservableObject {
         DispatchQueue.main.async {
             self.uiDevice = newDevice
             self.lensInfo = Metadata.lensInfo(for: newDevice)
+            self.starFocus = (UserDefaults.standard.object(forKey: "starFocus." + newDevice.uniqueID) as? NSNumber)?.floatValue
             self.currentLensID = newDevice.uniqueID
             UserDefaults.standard.set(newDevice.uniqueID, forKey: "lastLens")
             self.magnifierOn = false
@@ -689,7 +693,12 @@ final class CameraController: NSObject, ObservableObject {
         if !preset.autoShutter { exposureSeconds = max(preset.exposureSeconds, minDeviceExposure) }
         if let autoFocus = preset.autoFocus {
             self.autoFocus = autoFocus
-            if let position = preset.lensPosition { lensPosition = position }
+            if let position = preset.lensPosition {
+                lensPosition = position
+            } else if !autoFocus, let starFocus {
+                // Night scenes use the star focus saved for this lens.
+                lensPosition = starFocus
+            }
         }
         autoWhiteBalance = preset.autoWhiteBalance
         if !preset.autoWhiteBalance { whiteBalanceKelvin = preset.kelvin }
@@ -1262,10 +1271,36 @@ final class CameraController: NSObject, ObservableObject {
 
     /// Autofocus can't lock onto stars; in the dark it drifts to its closest setting and blurs everything.
     var focusHint: String? {
-        guard autoFocus else { return nil }
         let frameTime = autoShutter ? exposureSeconds : subExposure
         guard isLongExposure || frameTime >= 0.25 else { return nil }
-        return "Night: set focus to MF and focus on a bright star (magnifier + peaking)"
+        if autoFocus {
+            if let starFocus {
+                return String(format: "Night: tap ★ to use your star focus (%.2f)", starFocus)
+            }
+            return "Night: set focus to MF, focus on a bright star, then long-press ★ to save it"
+        }
+        if lensPosition > 0.95 && starFocus == nil {
+            return "Focus 1.00 is past infinity on iPhone. Stars are usually sharp around 0.75–0.85"
+        }
+        return nil
+    }
+
+    /// Remembers the current focus as "star focus" for this lens.
+    func saveStarFocus() {
+        guard let id = currentLensID else { return }
+        UserDefaults.standard.set(lensPosition, forKey: "starFocus." + id)
+        starFocus = lensPosition
+        show(String(format: "Star focus saved for this lens (%.2f)", lensPosition))
+    }
+
+    /// Switches to manual focus at the saved star focus.
+    func useStarFocus() {
+        guard let starFocus else {
+            show("Focus on a bright star (magnifier + peaking), then long-press ★ to save it")
+            return
+        }
+        setLensPosition(starFocus)
+        show(String(format: "Star focus %.2f", starFocus))
     }
 
     var exposureHint: String? {

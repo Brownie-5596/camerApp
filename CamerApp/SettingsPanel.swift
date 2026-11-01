@@ -131,6 +131,18 @@ struct SettingsPanel: View {
                                       set: { camera.setLensPosition(Float($0)) }),
                        in: 0...1)
                 Image(systemName: "mountain.2").font(.caption)
+                // Tap: jump to the saved star focus. Long-press: save the current focus as star focus.
+                Text("★")
+                    .font(.callout.bold())
+                    .foregroundStyle(camera.starFocus == nil ? theme.secondary : theme.accent)
+                    .frame(width: 30, height: 28)
+                    .contentShape(Rectangle())
+                    .onTapGesture { camera.useStarFocus() }
+                    .onLongPressGesture(minimumDuration: 0.6) {
+                        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                        camera.saveStarFocus()
+                    }
+                    .accessibilityLabel("Star focus")
             }
             .foregroundStyle(theme.secondary)
         case .whiteBalance:
