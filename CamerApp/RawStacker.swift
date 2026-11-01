@@ -231,7 +231,12 @@ final class RawStacker {
         }
         exif[kCGImagePropertyExifPixelXDimension as String] = width
         exif[kCGImagePropertyExifPixelYDimension as String] = height
-        exif[kCGImagePropertyExifUserComment as String] = comment
+        // Keep the settings the first frame was shot with.
+        if let original = exif[kCGImagePropertyExifUserComment as String] as? String, !original.isEmpty {
+            exif[kCGImagePropertyExifUserComment as String] = "\(comment) | first frame: \(original)"
+        } else {
+            exif[kCGImagePropertyExifUserComment as String] = comment
+        }
         output[kCGImagePropertyExifDictionary as String] = exif
 
         var tiff = properties[kCGImagePropertyTIFFDictionary as String] as? [String: Any] ?? [:]

@@ -20,6 +20,8 @@ struct ShotInfo {
     let evBias: Float
     let manualWhiteBalance: Bool
     let lens: LensInfo
+    /// The app's settings in words, stored in the photo so they can be checked later.
+    let settings: String
 }
 
 /// Builds EXIF / TIFF / GPS metadata so photos look like they came from the iPhone camera.
@@ -146,6 +148,7 @@ enum Metadata {
         case .stack(.brightest), .stack(.rawFrames): comment = "Brightest pixels of \(frames) × \(frameLabel) frames"
         case .lightning: comment = "Lightning trigger: brightest pixels of \(frames) × \(frameLabel) frames"
         }
+        let fullComment = "\(comment) | \(shot.settings)"
 
         let date = shot.date
         let dateString = exifDateFormatter.string(from: date)
@@ -178,7 +181,7 @@ enum Metadata {
             kCGImagePropertyExifColorSpace as String: 1,
             kCGImagePropertyExifSensingMethod as String: 2,
             kCGImagePropertyExifSceneType as String: 1,
-            kCGImagePropertyExifUserComment as String: comment,
+            kCGImagePropertyExifUserComment as String: fullComment,
         ]
         if let focal = shot.lens.focalLength { exif[kCGImagePropertyExifFocalLength as String] = focal }
         if let focal35 = shot.lens.focalLength35mm { exif[kCGImagePropertyExifFocalLenIn35mmFilm as String] = focal35 }
@@ -224,18 +227,28 @@ enum Metadata {
     }
 }
 
-/// Adds GPS to the metadata AVFoundation already writes (make, model, lens, exposure…).
+/// Adds GPS, the app's name and its settings to the metadata AVFoundation already writes
+/// (make, model, lens, exposure…).
 final class MetadataCustomizer: NSObject, AVCapturePhotoFileDataRepresentationCustomizer {
     private let gps: [String: Any]?
+    private let settings: String?
 
-    init(gps: [String: Any]?) {
+    init(gps: [String: Any]?, settings: String?) {
         self.gps = gps
+        self.settings = settings
     }
 
     func replacementMetadata(for photo: AVCapturePhoto) -> [String: Any]? {
-        guard let gps else { return nil }
         var metadata = photo.metadata
-        metadata[kCGImagePropertyGPSDictionary as String] = gps
+        if let gps { metadata[kCGImagePropertyGPSDictionary as String] = gps }
+        if let settings {
+            var tiff = metadata[kCGImagePropertyTIFFDictionary as String] as? [String: Any] ?? [:]
+            tiff[kCGImagePropertyTIFFSoftware as String] = Metadata.software
+            metadata[kCGImagePropertyTIFFDictionary as String] = tiff
+            var exif = metadata[kCGImagePropertyExifDictionary as String] as? [String: Any] ?? [:]
+            exif[kCGImagePropertyExifUserComment as String] = settings
+            metadata[kCGImagePropertyExifDictionary as String] = exif
+        }
         return metadata
     }
 }

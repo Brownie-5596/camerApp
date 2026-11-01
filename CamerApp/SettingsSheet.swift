@@ -13,6 +13,8 @@ struct SettingsSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var pickedPhotos: [PhotosPickerItem] = []
     @State private var choosingBlend = false
+    @State private var inspectedPhoto: PhotosPickerItem?
+    @State private var photoReport: String?
 
     var body: some View {
         NavigationStack {
@@ -113,6 +115,9 @@ struct SettingsSheet: View {
                 }
 
                 Section {
+                    PhotosPicker(selection: $inspectedPhoto, matching: .images, preferredItemEncoding: .current) {
+                        Label("Check a photo's settings…", systemImage: "info.circle")
+                    }
                     Button("Copy camera report") {
                         UIPasteboard.general.string = camera.cameraReport()
                         camera.show("Camera report copied")
@@ -120,7 +125,7 @@ struct SettingsSheet: View {
                 } header: {
                     Text("Troubleshooting")
                 } footer: {
-                    Text("Copies technical details about your camera and the app's settings. Paste it to Claude to help diagnose problems.")
+                    Text("Check a photo's settings shows how any photo was taken (app, settings, lens, exposure, location) and lets you copy it. Sharing the picture itself usually removes this information, so paste the text instead. The camera report copies details about your camera and the app.")
                 }
 
                 Section {
@@ -161,6 +166,21 @@ struct SettingsSheet: View {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }
                 }
+            }
+            .onChange(of: inspectedPhoto) { _, item in
+                guard let item else { return }
+                inspectedPhoto = nil
+                Task {
+                    if let data = try? await item.loadTransferable(type: Data.self) {
+                        photoReport = PhotoInspector.report(for: data)
+                    } else {
+                        photoReport = "Couldn't load that photo."
+                    }
+                }
+            }
+            .sheet(isPresented: Binding(get: { photoReport != nil }, set: { if !$0 { photoReport = nil } })) {
+                PhotoReportView(report: photoReport ?? "", theme: theme)
+                    .presentationBackground(.black)
             }
             .onChange(of: pickedPhotos) { _, items in
                 if !items.isEmpty { choosingBlend = true }

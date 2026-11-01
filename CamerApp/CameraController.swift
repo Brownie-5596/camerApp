@@ -920,7 +920,8 @@ final class CameraController: NSObject, ObservableObject {
                  evBias: evBias,
                  manualWhiteBalance: !autoWhiteBalance,
                  lens: lensInfo ?? LensInfo(model: "\(Metadata.deviceModel) back camera", focalLength: nil,
-                                            focalLength35mm: nil, fNumber: 1.8))
+                                            focalLength35mm: nil, fNumber: 1.8),
+                 settings: settingsSummary(format: format))
     }
 
     private func startStack(completion: @escaping (Bool) -> Void) {
@@ -1100,6 +1101,7 @@ final class CameraController: NSObject, ObservableObject {
         let angle = rotationCoordinator?.videoRotationAngleForHorizonLevelCapture
         let fix = location.snapshot(enabled: saveLocation)
         let gps = fix.location.map { Metadata.gps(location: $0, heading: fix.heading) }
+        let settings = settingsSummary(format: format)
         let deviceID = currentLensID
         isCapturing = true
 
@@ -1144,7 +1146,7 @@ final class CameraController: NSObject, ObservableObject {
                 self.isCapturing = false
                 completion(success)
             }
-            let processor = PhotoCaptureProcessor(gps: gps, location: fix.location, deviceID: deviceID, onRAWData: onRAWData, onExposureDone: {
+            let processor = PhotoCaptureProcessor(gps: gps, settings: settings, location: fix.location, deviceID: deviceID, onRAWData: onRAWData, onExposureDone: {
                 DispatchQueue.main.async {
                     counted = true
                     self.processingCount += 1
@@ -1232,6 +1234,28 @@ final class CameraController: NSObject, ObservableObject {
             return "Camera Control installed (\(names.count)): \(names.joined(separator: ", "))"
         }
         return "Camera Control: needs iOS 18"
+    }
+
+    /// The app's settings in one line; stored in every photo (EXIF user comment) so they can be checked later.
+    func settingsSummary(format: OutputFormat) -> String {
+        let lens = lenses.first { $0.id == currentLensID }?.name ?? "?"
+        var parts = [
+            Metadata.software,
+            "\(format.rawValue) \(megapixels(for: format))MP",
+            "lens \(lens), zoom \(String(format: "%.1f", zoomFactor))×",
+            "ISO \(Int(iso.rounded())) \(autoISO ? "auto" : "manual")",
+            "shutter \(bulb ? "BULB" : Stops.shutterLabel(exposureSeconds)) \(autoShutter ? "auto" : "manual")",
+            "EV \(Stops.evLabel(evBias))",
+            autoFocus ? "AF" : "MF \(String(format: "%.2f", lensPosition))",
+            autoWhiteBalance ? "AWB" : "WB \(Int(whiteBalanceKelvin.rounded()))K",
+        ]
+        if isLongExposure {
+            let mode = stackMode == .rawFrames ? "RAW frames + \(rawBlend.rawValue)" : stackMode.rawValue
+            let frames = plannedFrames.map { "\($0)" } ?? "BULB"
+            parts.append("long exposure \(mode), \(frames) × \(Stops.shutterLabel(subExposure))")
+            parts.append("align \(alignFrames ? "on" : "off")")
+        }
+        return parts.joined(separator: " · ")
     }
 
     /// Everything useful for diagnosing problems remotely, to paste into a chat.

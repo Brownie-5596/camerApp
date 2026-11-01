@@ -24,13 +24,13 @@ final class PhotoCaptureProcessor: NSObject, AVCapturePhotoCaptureDelegate {
     private var processingEnded: CFTimeInterval?
     private var expectedProcessing: Double?
 
-    init(gps: [String: Any]?, location: CLLocation?, deviceID: String?,
+    init(gps: [String: Any]?, settings: String?, location: CLLocation?, deviceID: String?,
          onRAWData: ((Data) -> Void)? = nil,
          onExposureDone: @escaping () -> Void,
          onCaptured: @escaping (Bool) -> Void,
          onSaved: @escaping (Bool, String) -> Void,
          onTiming: @escaping (String) -> Void) {
-        self.customizer = MetadataCustomizer(gps: gps)
+        self.customizer = MetadataCustomizer(gps: gps, settings: settings)
         self.location = location
         self.deviceID = deviceID
         self.onRAWData = onRAWData
