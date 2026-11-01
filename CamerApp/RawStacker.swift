@@ -58,10 +58,19 @@ final class RawStacker {
     private var totalExposure = 0.0
     private var sourceDescription = "photos"
 
-    init(mode: StackMode, align: Bool, fieldOfView: Double?) {
+    /// Number of frames that will be stacked. Long exposures develop each RAW frame this many times
+    /// brighter (in linear light, before the tone curve), like one real exposure of the total length.
+    let expectedFrames: Int
+
+    init(mode: StackMode, align: Bool, fieldOfView: Double?, expectedFrames: Int) {
         self.mode = mode
         self.align = align
         self.fieldOfView = fieldOfView
+        self.expectedFrames = max(1, expectedFrames)
+    }
+
+    private var exposureBoost: Float {
+        mode == .longExposure ? Float(log2(Double(expectedFrames))) : 0
     }
 
     deinit {
@@ -72,7 +81,7 @@ final class RawStacker {
     /// Adds one photo. `rotationSinceFirst` is how far the gyroscope says the phone turned since the
     /// first frame (radians); nil means unknown, so the pictures are always compared.
     func add(imageData: Data, rotationSinceFirst: Double?) {
-        guard var image = Self.develop(imageData) else {
+        guard var image = Self.develop(imageData, exposureBoost: exposureBoost) else {
             skipped += 1
             return
         }
@@ -106,16 +115,21 @@ final class RawStacker {
         if align {
             let pyramid = Alignment.pyramid(fromLinear: frame, width: w, height: h)
             if let reference {
-                var worthChecking = true
+                // `rotationSinceFirst` is nil for library photos (always compare), 0 when the
+                // gyroscope saw no bump, otherwise how far the phone turned.
+                var expected: Double?
                 if let angle = rotationSinceFirst, let fieldOfView {
-                    let pixelsPerRadian = Double(w) / 2 / tan(fieldOfView * .pi / 360)
-                    worthChecking = angle * pixelsPerRadian > 1.5
+                    expected = angle * Double(w) / 2 / tan(fieldOfView * .pi / 360)
                 }
-                if worthChecking, let finest = reference.last {
+                if expected.map({ $0 >= 1.5 }) ?? true, let finest = reference.last {
                     let s = Alignment.shift(reference: reference, moving: pyramid)
                     let scale = Double(w) / Double(finest.width)
-                    shift = (Int((s.dx * scale).rounded()), Int((s.dy * scale).rounded()))
-                    if shift.dx != 0 || shift.dy != 0 { aligned += 1 }
+                    let dx = s.dx * scale
+                    let dy = s.dy * scale
+                    if Alignment.agrees(measured: (dx * dx + dy * dy).squareRoot(), gyroscopePixels: expected) {
+                        shift = (Int(dx.rounded()), Int(dy.rounded()))
+                        aligned += 1
+                    }
                 }
             } else {
                 reference = pyramid
@@ -164,8 +178,9 @@ final class RawStacker {
         let bytes = Data(bytesNoCopy: acc, count: width * height * 8, deallocator: .none)
         var image = CIImage(bitmapData: bytes, bytesPerRow: width * 8,
                             size: CGSize(width: width, height: height), format: .RGBAh, colorSpace: linear)
-        if mode == .longExposure && count > 1 {
-            let gain = CGFloat(count)
+        // Frames were already developed for the planned total; adjust if fewer made it in.
+        if mode == .longExposure && count != expectedFrames {
+            let gain = CGFloat(count) / CGFloat(expectedFrames)
             image = image.applyingFilter("CIColorMatrix", parameters: [
                 "inputRVector": CIVector(x: gain, y: 0, z: 0, w: 0),
                 "inputGVector": CIVector(x: 0, y: gain, z: 0, w: 0),
@@ -200,13 +215,15 @@ final class RawStacker {
 
     /// Develops a RAW (DNG/ProRAW) with noise reduction off (stacking removes the noise instead),
     /// or decodes any other photo.
-    private static func develop(_ data: Data) -> CIImage? {
+    private static func develop(_ data: Data, exposureBoost: Float) -> CIImage? {
         if let raw = CIRAWFilter(imageData: data, identifierHint: nil), raw.outputImage != nil {
             if raw.isLuminanceNoiseReductionSupported { raw.luminanceNoiseReductionAmount = 0 }
             if raw.isColorNoiseReductionSupported { raw.colorNoiseReductionAmount = 0 }
+            raw.exposure = exposureBoost
             return raw.outputImage
         }
-        return CIImage(data: data, options: [.applyOrientationProperty: true])
+        guard let image = CIImage(data: data, options: [.applyOrientationProperty: true]) else { return nil }
+        return exposureBoost == 0 ? image : image.applyingFilter("CIExposureAdjust", parameters: [kCIInputEVKey: exposureBoost])
     }
 
     private static func readProperties(_ data: Data) -> [String: Any] {
@@ -293,15 +310,24 @@ final class RawStackSession {
             }
             let (files, attitudes) = self.queue.sync { (self.files, self.attitudes) }
             let indices = files.keys.sorted()
-            let stacker = RawStacker(mode: self.mode, align: self.align, fieldOfView: self.fieldOfView)
+            let stacker = RawStacker(mode: self.mode, align: self.align, fieldOfView: self.fieldOfView,
+                                     expectedFrames: indices.count)
             let firstAttitude = indices.first.flatMap { attitudes[$0] }
+            var previousAttitude = firstAttitude
+            var bumped = false
             for (n, index) in indices.enumerated() {
                 DispatchQueue.main.async { progress("Stacking RAW \(n + 1)/\(indices.count)…") }
                 autoreleasepool {
                     guard let url = files[index], let data = try? Data(contentsOf: url) else { return }
-                    var rotation: Double?
+                    // 0 = no bump seen, so frames are left exactly where they are.
+                    var rotation: Double? = 0
                     if let first = firstAttitude, let current = attitudes[index] {
-                        rotation = Motion.angle(first, current)
+                        if let previous = previousAttitude,
+                           Motion.angle(previous, current) * 180 / .pi > Alignment.bumpDegrees {
+                            bumped = true
+                        }
+                        previousAttitude = current
+                        rotation = bumped ? Motion.angle(first, current) : 0
                     }
                     stacker.add(imageData: data, rotationSinceFirst: rotation)
                     try? FileManager.default.removeItem(at: url)

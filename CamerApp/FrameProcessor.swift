@@ -56,6 +56,8 @@ final class FrameProcessor: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
         let alignFieldOfView: Double?
         var reference: [GrayImage]?
         var referenceAttitude: CMQuaternion?
+        var lastAttitude: CMQuaternion?
+        var bumped = false
         var aligned = 0
 
         init(stacker: Stacker, total: Int?, metadata: @escaping MetadataBuilder, alignFieldOfView: Double?,
@@ -213,26 +215,36 @@ final class FrameProcessor: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
         }
     }
 
-    /// Gyroscope says whether the phone turned since the first frame; if it did, measure the shift
-    /// from the pictures themselves. Returns the shift in frame pixels.
+    /// Only when the gyroscope sees a sudden bump (not slow drift) are the pictures compared, and a
+    /// shift is used only if the pictures and the gyroscope agree on how far it moved.
+    /// Returns the shift in frame pixels.
     private func alignmentShift(for frame: FrameView, job: StackJob) -> (dx: Int, dy: Int) {
         guard let fieldOfView = job.alignFieldOfView else { return (0, 0) }
         let attitude = Motion.shared.attitude
+        defer { job.lastAttitude = attitude }
         guard let reference = job.reference else {
             job.reference = Alignment.pyramid(from: frame)
             job.referenceAttitude = attitude
             return (0, 0)
         }
-        if let first = job.referenceAttitude, let attitude {
-            let pixelsPerRadian = Double(frame.width) / 2 / tan(fieldOfView * .pi / 360)
-            if Motion.angle(first, attitude) * pixelsPerRadian < 1.5 { return (0, 0) }
+        if let last = job.lastAttitude, let attitude,
+           Motion.angle(last, attitude) * 180 / .pi > Alignment.bumpDegrees {
+            job.bumped = true
         }
-        guard let finest = reference.last else { return (0, 0) }
+        guard job.bumped, let finest = reference.last else { return (0, 0) }
+
+        let pixelsPerRadian = Double(frame.width) / 2 / tan(fieldOfView * .pi / 360)
+        var expected: Double?
+        if let first = job.referenceAttitude, let attitude {
+            expected = Motion.angle(first, attitude) * pixelsPerRadian
+        }
         let s = Alignment.shift(reference: reference, moving: Alignment.pyramid(from: frame))
         let scale = Double(frame.width) / Double(finest.width)
-        let shift = (dx: Int((s.dx * scale).rounded()), dy: Int((s.dy * scale).rounded()))
-        if shift.dx != 0 || shift.dy != 0 { job.aligned += 1 }
-        return shift
+        let dx = s.dx * scale
+        let dy = s.dy * scale
+        guard Alignment.agrees(measured: (dx * dx + dy * dy).squareRoot(), gyroscopePixels: expected) else { return (0, 0) }
+        job.aligned += 1
+        return (Int(dx.rounded()), Int(dy.rounded()))
     }
 
     private func completeJob() {

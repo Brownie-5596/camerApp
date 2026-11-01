@@ -14,6 +14,7 @@ final class PhotoCaptureProcessor: NSObject, AVCapturePhotoCaptureDelegate {
     private let onCaptured: (Bool) -> Void
     private let onSaved: (Bool, String) -> Void
     private let onTiming: (String) -> Void
+    private let onActualExposure: ((Double, Int) -> Void)?
     private var processed: Data?
     private var raw: Data?
 
@@ -29,7 +30,8 @@ final class PhotoCaptureProcessor: NSObject, AVCapturePhotoCaptureDelegate {
          onExposureDone: @escaping () -> Void,
          onCaptured: @escaping (Bool) -> Void,
          onSaved: @escaping (Bool, String) -> Void,
-         onTiming: @escaping (String) -> Void) {
+         onTiming: @escaping (String) -> Void,
+         onActualExposure: ((Double, Int) -> Void)? = nil) {
         self.customizer = MetadataCustomizer(gps: gps, settings: settings)
         self.location = location
         self.deviceID = deviceID
@@ -38,6 +40,7 @@ final class PhotoCaptureProcessor: NSObject, AVCapturePhotoCaptureDelegate {
         self.onCaptured = onCaptured
         self.onSaved = onSaved
         self.onTiming = onTiming
+        self.onActualExposure = onActualExposure
     }
 
     func photoOutput(_ output: AVCapturePhotoOutput, willBeginCaptureFor resolvedSettings: AVCaptureResolvedPhotoSettings) {
@@ -59,6 +62,11 @@ final class PhotoCaptureProcessor: NSObject, AVCapturePhotoCaptureDelegate {
     func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
         processingEnded = CACurrentMediaTime()
         guard error == nil, let data = photo.fileDataRepresentation(with: customizer) else { return }
+        if let exif = photo.metadata[kCGImagePropertyExifDictionary as String] as? [String: Any],
+           let seconds = exif[kCGImagePropertyExifExposureTime as String] as? Double {
+            let iso = (exif[kCGImagePropertyExifISOSpeedRatings as String] as? [Int])?.first ?? 0
+            onActualExposure?(seconds, iso)
+        }
         if photo.isRawPhoto {
             raw = data
             onRAWData?(data)
@@ -105,6 +113,26 @@ final class PhotoCaptureProcessor: NSObject, AVCapturePhotoCaptureDelegate {
         if let expectedProcessing { text += String(format: " (iOS expected processing up to %.2fs)", expectedProcessing) }
         onTiming(text)
     }
+
+    private static func isPermanent(_ error: Error?) -> Bool {
+        guard let error = error as NSError?, error.domain == PHPhotosErrorDomain else { return false }
+        return [3305, 3310, 3311].contains(error.code)
+    }
+
+    /// Plain-English versions of the Photos errors people actually hit.
+    private static func describe(_ error: Error?) -> String {
+        guard let error = error as NSError? else { return "unknown error" }
+        if error.domain == PHPhotosErrorDomain {
+            switch error.code {
+            case 3305: return "not enough storage on the iPhone. Free up space and try again"
+            case 3301: return "Photos was interrupted (often low storage or too many large files at once)"
+            case 3310, 3311: return "the app isn't allowed to add photos. Check Settings → Privacy → Photos"
+            case 3302, 3303: return "the image file was invalid (code \(error.code))"
+            default: break
+            }
+        }
+        return "\(error.localizedDescription) (code \(error.code))"
+    }
 }
 
 enum PhotoLibrary {
@@ -129,6 +157,7 @@ enum PhotoLibrary {
                      raw: Data? = nil,
                      location: CLLocation? = nil,
                      successMessage: String,
+                     attempt: Int = 1,
                      completion: @escaping (Bool, String) -> Void) {
         let finish: (Bool, String) -> Void = { ok, message in
             DispatchQueue.main.async { completion(ok, message) }
@@ -153,8 +182,15 @@ enum PhotoLibrary {
                 if success {
                     onSaved?(primary)
                     finish(true, successMessage)
+                } else if attempt < 3, !isPermanent(error) {
+                    // Saving can be interrupted while Photos is busy (e.g. with a burst of big RAW
+                    // files); try again shortly.
+                    DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1.5 * Double(attempt)) {
+                        save(primary: primary, primaryType: primaryType, raw: raw, location: location,
+                             successMessage: successMessage, attempt: attempt + 1, completion: completion)
+                    }
                 } else {
-                    finish(false, "Save failed: \(error?.localizedDescription ?? "unknown error")")
+                    finish(false, "Save failed: \(describe(error))")
                 }
             }
         }

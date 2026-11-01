@@ -125,7 +125,8 @@ final class CameraController: NSObject, ObservableObject {
             guard stackMode != oldValue else { return }
             updateHistogramGain()
             if stackMode == .rawFrames && !format.isSingleRAW {
-                format = proRAWSupported ? .proRAW : .raw
+                // Plain RAW: untouched sensor data, honours long exposures, and stacks best.
+                format = rawSupported ? .raw : .proRAW
                 show("RAW frames: each frame saved as \(outputMegapixels) MP \(format.rawValue)")
             }
         }
@@ -206,7 +207,7 @@ final class CameraController: NSObject, ObservableObject {
         }
     }
     /// Line frames up again if the camera moves during a stack.
-    @Published var alignFrames = true {
+    @Published var alignFrames = false {
         didSet { UserDefaults.standard.set(alignFrames, forKey: "alignFrames") }
     }
     /// Save in-app RAW stacks as 16-bit TIFF (large, best for editing) instead of 10-bit HEIF.
@@ -231,7 +232,12 @@ final class CameraController: NSObject, ObservableObject {
             saveLocation = defaults.bool(forKey: "saveLocation")
         }
         rawBlend = RawBlend(rawValue: defaults.string(forKey: "rawBlend") ?? "") ?? .average
-        if defaults.object(forKey: "alignFrames") != nil { alignFrames = defaults.bool(forKey: "alignFrames") }
+        // Version 0.3.10 could shift frames when the camera hadn't moved; start again from off.
+        if !defaults.bool(forKey: "alignFrames.reset") {
+            defaults.set(true, forKey: "alignFrames.reset")
+            defaults.set(false, forKey: "alignFrames")
+        }
+        alignFrames = defaults.bool(forKey: "alignFrames")
         stackAsTIFF = defaults.bool(forKey: "stackAsTIFF")
         frameProcessor.onHistogram = { [weak self] in self?.histogram = $0 }
         frameProcessor.onOverlay = { [weak self] in self?.overlayImage = $0 }
@@ -982,6 +988,14 @@ final class CameraController: NSObject, ObservableObject {
         let frames = plannedFrames
         // Follow the chosen format if it's a RAW one; otherwise use the best RAW available.
         let rawFormat = rawFramesFormat
+        // Each frame is a big file, and blending in the app keeps a temporary copy too.
+        let frameMB = Double(megapixels(for: rawFormat) > 13 ? 75 : (rawFormat == .proRAW ? 25 : 20))
+        let neededGB = Double(frames ?? 60) * frameMB * (rawBlend == .off ? 1 : 2) / 1000 + 0.5
+        if let freeGB = freeSpaceGB(), freeGB < neededGB {
+            show(String(format: "Not enough storage: %.1f GB free, this needs about %.1f GB", freeGB, neededGB))
+            completion(false)
+            return
+        }
         // Optionally blend the frames into one picture in the app as well.
         var session: RawStackSession?
         if let mode = rawBlend.stackMode {
@@ -1056,7 +1070,7 @@ final class CameraController: NSObject, ObservableObject {
         let align = alignFrames
         let tiff = stackAsTIFF
         Task.detached(priority: .userInitiated) { [weak self] in
-            let stacker = RawStacker(mode: mode, align: align, fieldOfView: nil)
+            let stacker = RawStacker(mode: mode, align: align, fieldOfView: nil, expectedFrames: count)
             for i in 0..<count {
                 await MainActor.run { self?.rawStackStatus = "Stacking photo \(i + 1)/\(count)…" }
                 guard let data = await load(i) else { continue }
@@ -1078,6 +1092,13 @@ final class CameraController: NSObject, ObservableObject {
                 }
             }
         }
+    }
+
+    private func freeSpaceGB() -> Double? {
+        let home = URL(fileURLWithPath: NSHomeDirectory())
+        guard let values = try? home.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
+              let free = values.volumeAvailableCapacityForImportantUsage else { return nil }
+        return Double(free) / 1_000_000_000
     }
 
     private func updateDeviceStatus() {
@@ -1102,6 +1123,7 @@ final class CameraController: NSObject, ObservableObject {
         let fix = location.snapshot(enabled: saveLocation)
         let gps = fix.location.map { Metadata.gps(location: $0, heading: fix.heading) }
         let settingsNote = settingsSummary(format: format)
+        let requestedExposure: Double? = autoShutter ? nil : subExposure
         let deviceID = currentLensID
         isCapturing = true
 
@@ -1163,6 +1185,12 @@ final class CameraController: NSObject, ObservableObject {
                 self.show(message)
             }, onTiming: { timing in
                 self.lastCaptureTiming.set(timing)
+            }, onActualExposure: { seconds, iso in
+                // Tell the user when iOS didn't use the exposure they set.
+                guard let requested = requestedExposure, seconds < requested / 2 else { return }
+                DispatchQueue.main.async {
+                    self.show("iOS changed this shot to \(Stops.shutterLabel(seconds)) at ISO \(iso) instead of \(Stops.shutterLabel(requested))")
+                }
             })
             self.inFlight[id] = processor
             if let failure = Diagnostics.guarded("capture", { self.photoOutput.capturePhoto(with: settings, delegate: processor) }) {
@@ -1200,6 +1228,9 @@ final class CameraController: NSObject, ObservableObject {
     /// Plain (Bayer) RAW is a 12 MP readout; ProRAW comes in 12 or 48 MP; HEIF in any size.
     func megapixels(for format: OutputFormat) -> Int {
         let smallest = availableMegapixels.first ?? 12
+        // The full 48 MP readout only works for short exposures; iOS silently swaps longer ones
+        // for 1/15 s at a huge ISO (black or ruined photos), so stay at 12 MP for those.
+        if !exposureAllowsHighResolution { return smallest }
         switch format {
         case .raw, .rawPlusHEIF: return smallest
         case .proRAW: return effectiveMegapixels > 12 ? (availableMegapixels.last ?? smallest) : smallest
@@ -1207,12 +1238,21 @@ final class CameraController: NSObject, ObservableObject {
         }
     }
 
+    /// iOS reads out the whole 48 MP sensor only at about 1/15 s or faster. (Apple's own Night mode
+    /// photos are 12 MP for the same reason.)
+    static let maxHighResolutionExposure = 1.0 / 15
+
+    var exposureAllowsHighResolution: Bool {
+        if autoShutter { return true }
+        return !isLongExposure && exposureSeconds <= Self.maxHighResolutionExposure * 1.05
+    }
+
     /// Size of the next normal photo.
     var outputMegapixels: Int { megapixels(for: format) }
 
     /// Format each frame is saved in by the RAW frames long-exposure mode.
     var rawFramesFormat: OutputFormat {
-        format.isSingleRAW ? format : (proRAWSupported ? .proRAW : .raw)
+        format.isSingleRAW ? format : (rawSupported ? .raw : .proRAW)
     }
 
     /// What a long exposure will produce, e.g. "12MP HEIF" or "48MP ProRAW frames".

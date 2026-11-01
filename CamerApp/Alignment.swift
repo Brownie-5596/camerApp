@@ -81,6 +81,17 @@ enum Alignment {
         return result.reversed()
     }
 
+    /// Smallest sudden turn between two frames (degrees) that counts as a bump. Slow gyroscope drift
+    /// and sensor noise stay well below this, so a still camera is never "corrected".
+    static let bumpDegrees = 0.1
+
+    /// Accepts a measured shift only if it is roughly what the gyroscope says the phone turned.
+    static func agrees(measured: Double, gyroscopePixels: Double?) -> Bool {
+        guard measured >= 1 else { return false }
+        guard let expected = gyroscopePixels else { return true }
+        return measured > expected * 0.4 && measured < expected * 2.5 + 3
+    }
+
     /// How far the picture moved: something at (x, y) in `reference` is at (x + dx, y + dy) in
     /// `moving`, in finest-level pixels (y points down). Returns (0, 0) when it can't tell.
     static func shift(reference: [GrayImage], moving: [GrayImage]) -> (dx: Double, dy: Double) {
@@ -108,7 +119,7 @@ enum Alignment {
         // Only trust a match that is clearly better than "didn't move".
         let center = difference(ref, mov, cx, cy)
         let still = difference(ref, mov, 0, 0)
-        guard center < still * 0.97 else { return (0, 0) }
+        guard center < still * 0.9 else { return (0, 0) }
         let fx = parabola(difference(ref, mov, cx - 1, cy), center, difference(ref, mov, cx + 1, cy))
         let fy = parabola(difference(ref, mov, cx, cy - 1), center, difference(ref, mov, cx, cy + 1))
         return (Double(cx) + fx, Double(cy) + fy)

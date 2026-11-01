@@ -155,12 +155,34 @@ final class Stacker {
         let pixelCount = width * height
         var pixels = [UInt8](repeating: 255, count: pixelCount * 4)
 
+        // Adding frames also adds up every frame's dark level and noise floor, which turns a black
+        // night sky into gray-green haze. Measure that floor (the darkest 1 % of each colour) and
+        // take back all but one frame's worth, using the darkest colour so black stays neutral.
+        var offsets: [Float] = [0, 0, 0]
+        if mode == .longExposure && count > 1 {
+            var floors: [Float] = [0, 0, 0]
+            let step = max(1, pixelCount / 50_000)
+            for c in 0..<3 {
+                var samples: [Float] = []
+                samples.reserveCapacity(pixelCount / step + 1)
+                var p = 0
+                while p < pixelCount {
+                    samples.append(acc[p * 4 + c])
+                    p += step
+                }
+                samples.sort()
+                floors[c] = samples[samples.count / 100]
+            }
+            let black = (floors.min() ?? 0) / Float(count)
+            offsets = floors.map { max(0, $0 - black) }
+        }
+
         Self.fromLinear.withUnsafeBufferPointer { lut in
             pixels.withUnsafeMutableBufferPointer { out in
                 for p in 0..<pixelCount {
                     let i = p * 4
                     for c in 0..<3 {
-                        let v = min(max(acc[i + c] * scale, 0), 1)
+                        let v = min(max(acc[i + c] * scale - offsets[c], 0), 1)
                         out[i + c] = lut[Int(v * 4095)]
                     }
                 }

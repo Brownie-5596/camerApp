@@ -241,7 +241,9 @@ struct ContentView: View {
                     let choices = camera.availableMegapixels
                     let i = choices.firstIndex(of: camera.outputMegapixels) ?? 0
                     camera.preferredMegapixels = choices[(i + 1) % choices.count]
-                    if camera.lastMessage == nil || !camera.lastMessage!.contains("ProRAW") {
+                    if !camera.exposureAllowsHighResolution {
+                        camera.show("48 MP only works at 1/15 s or faster. Longer shots are 12 MP")
+                    } else if camera.lastMessage == nil || !camera.lastMessage!.contains("ProRAW") {
                         camera.show("Photo size \(camera.outputMegapixels) MP \(camera.format.rawValue)")
                     }
                 }
